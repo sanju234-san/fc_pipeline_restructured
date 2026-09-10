@@ -1,0 +1,1 @@
+"""SanityCheckFlags, ArtifactDetectionResult, ArtifactSignatures, EvaluationVerdict."""

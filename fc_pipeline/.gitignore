@@ -1,0 +1,22 @@
+# Environment & credentials
+.env
+.env.*
+*.env
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Outputs and logs (keep directory, ignore contents except .gitkeep)
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# MLflow experiment tracking data
+mlruns/
+
+# Packaging build artifacts
+*.egg-info/
