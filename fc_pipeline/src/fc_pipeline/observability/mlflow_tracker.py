@@ -82,15 +82,19 @@ class MLflowTracker:
         except Exception as e:
             logger.warning(f"Failed to initialize MLflow tracking at '{self.tracking_dir}': {e}")
 
-    def start_run(self, run_id: str) -> Optional[Run]:
-        """Start an MLflow run tagged with the scenario ID."""
+    def start_run(self, run_id: str, tags: Optional[Dict[str, Any]] = None) -> Optional[Run]:
+        """Start an MLflow run tagged with the scenario ID and optional lineage tags."""
         try:
             self.init_tracking()
             # If a prior run was left open, end it gracefully
             if mlflow.active_run() is not None:
                 mlflow.end_run()
 
-            run = mlflow.start_run(run_name=run_id, tags={"scenario_id": run_id})
+            run_tags = {"scenario_id": run_id}
+            if tags:
+                run_tags.update(tags)
+
+            run = mlflow.start_run(run_name=run_id, tags=run_tags)
             self._active_run = run
             return run
         except Exception as e:

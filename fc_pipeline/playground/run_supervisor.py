@@ -48,6 +48,7 @@ import numpy as np
 import mne
 
 from fc_pipeline.agentic.supervisor.llm_provider import get_supervisor_llm
+from fc_pipeline.agentic.supervisor.query_transformer import transform_query
 from fc_pipeline.agentic.supervisor.tools.dataset_info import get_dataset_info
 from fc_pipeline.agentic.supervisor.tools.dataset_conditions import get_dataset_conditions
 from fc_pipeline.config.thresholds import (
@@ -431,6 +432,13 @@ def run_playground():
         default=None,
         help="Run only a specific case number (1-6).",
     )
+    parser.add_argument(
+        "--transform",
+        "-t",
+        action="store_true",
+        default=False,
+        help="Enable query transformer pre-processing step before each test case (logs output, does not alter pipeline input).",
+    )
     args = parser.parse_args()
 
     print("=" * 70)
@@ -564,6 +572,28 @@ def run_playground():
         print(f"Query:   \"{tc['query']}\"")
         print(f"Goal:    {tc['description']}")
         print("-" * 70)
+
+        # Optional: Query Transformer pre-step (--transform / -t)
+        if args.transform:
+            print("\n[Query Transformer] Running pre-processing step...")
+            try:
+                qt_result = transform_query(
+                    accumulated_query=tc["query"],
+                    latest_user_message=tc["query"],
+                )
+                print(f"  -> INTENT:         {qt_result.intent}")
+                print(f"  -> CONDENSED:      {qt_result.condensed}")
+                print(f"  -> CONTRADICTION:  {qt_result.contradiction}")
+                print(f"  -> CLARIFICATION:  {qt_result.clarification}")
+                if qt_result.is_out_of_scope:
+                    print("  -> [SKIPPED] Out-of-scope request — Supervisor would not be invoked.")
+                elif qt_result.has_contradiction:
+                    print("  -> [FLAGGED] Contradiction detected — would block for user clarification.")
+                else:
+                    print("  -> [OK] Clean passthrough to Supervisor.")
+            except Exception as qt_err:
+                print(f"  -> [ERROR] Query transformer failed: {qt_err}")
+            print()
 
         # Passive Observability: Start MLflow run for current scenario
         current_mlflow_run_id = "N/A"
