@@ -7,6 +7,8 @@ privacy masking.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import logging
 import os
 import re
@@ -255,3 +257,32 @@ def log_trace_events(event_count: int) -> None:
 
 def end_run(status: Optional[str] = None) -> None:
     _default_tracker.end_run(status=status)
+
+@contextmanager
+def trace_span(name, span_type="TOOL", inputs=None):
+    """Create a child MLflow span, degrading to a no-op if tracing is unavailable.
+
+    NOTE: mlflow.start_span() does NOT accept an `inputs=` kwarg - passing one
+    raises TypeError, which (when swallowed by a bare except) silently turns every
+    child span into a no-op. Inputs must be attached via span.set_inputs() on the
+    yielded LiveSpan instead. We therefore call start_span() with only documented
+    kwargs and set inputs afterwards, guarding each step independently so a failure
+    in observability never breaks business logic.
+    """
+    try:
+        import mlflow as _mlflow
+        cm = _mlflow.start_span(name=name, span_type=span_type)
+    except Exception:
+        yield None
+        return
+
+    try:
+        with cm as span:
+            if inputs:
+                try:
+                    span.set_inputs(inputs)
+                except Exception:
+                    pass
+            yield span
+    except Exception:
+        yield None

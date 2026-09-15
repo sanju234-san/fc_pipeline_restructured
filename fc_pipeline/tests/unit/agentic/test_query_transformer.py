@@ -1244,10 +1244,13 @@ class TestGate1PerRowEdits:
         # And must contain the actual override filename (eeg.fif) after the masked root
         assert "eeg.fif" in approved_cell_data
 
-        # proposed_value column (index 3) is intentionally NOT masked in the spec
+        # proposed_value column (index 3) is ALSO run through mask_text per user ruling
+        # (consistent with Approved Value and edit prompt display)
         proposed_cell_data = data_cells[3]
-        # Sanity: the proposed value does contain the raw path (it's not run through mask_text — correct)
-        assert "C:\\Users\\john" in proposed_cell_data.replace("\\\\", "\\") or proposed_cell_data.count("Users") >= 1
+        assert "[LOCAL_ROOT]/" in proposed_cell_data
+        assert "john" not in proposed_cell_data
+        assert "C:\\Users\\john" not in proposed_cell_data
+        assert "eeg.fif" in proposed_cell_data
 
         # Row 2: human_approved_value is None → renders "—"
         freq_cells = [c.strip() for c in lines[3].split("|")]

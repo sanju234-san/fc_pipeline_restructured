@@ -17,11 +17,14 @@ from typing import Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from fc_pipeline.agentic.supervisor.llm_provider import get_supervisor_llm
+from fc_pipeline.observability.mlflow_tracker import trace_span
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# System prompt (v3 — final, approved)
+# System prompt (v4 — fixes bare-parameter-less requests being misclassified
+# as out_of_scope; see "IMPORTANT" note under INTENT CLASSIFICATION and
+# Example 9)
 # ---------------------------------------------------------------------------
 
 QUERY_TRANSFORMER_SYSTEM_PROMPT = """\
@@ -33,6 +36,8 @@ YOUR TWO TASKS:
    Classify the request into exactly one category:
    - "eeg_analysis": The user is requesting EEG functional connectivity analysis, parameter exploration, dataset inspection, or a closely related neuroscience task (e.g., requesting a plot, asking about frequency bands, channels, conditions, metrics).
    - "out_of_scope": The request is clearly unrelated to EEG/neuroscience analysis (e.g., weather, jokes, general knowledge, file deletion, coding help unrelated to this pipeline).
+
+   IMPORTANT: Missing or unspecified analysis parameters (frequency band, channels, condition, metrics) are NEVER by themselves evidence of "out_of_scope". Some valid requests need no analysis parameters at all — e.g. a bare request for a dataset overview plot. Classify based on subject matter (is this about this EEG dataset / pipeline at all?), not parameter completeness. Parameter completeness is enforced separately, downstream, by the Supervisor's zero-guessing checks on the 3 mandatory axes — that is not this component's job.
 
 2. CONVERSATIONAL CONDENSATION (only if intent = "eeg_analysis")
    Collapse the full conversation into ONE clear, self-contained request reflecting the user's CURRENT intent. Follow these rules:
@@ -59,6 +64,10 @@ YOUR TWO TASKS:
    AMBIGUITY TIE-BREAKER: When it is genuinely unclear whether something is a contradiction or a refinement, treat it as a refinement and proceed. Only flag when two turns make mutually exclusive claims about the same scientific axis.
 
    IMPORTANT: Do NOT normalize, rename, or abbreviate metric names (e.g., do not convert "phase lag index" to "PLI"). Pass through exactly what the user wrote. Metric normalization is handled by a separate downstream component.
+
+BEFORE YOU OUTPUT — MANDATORY SELF-CHECK ON INTENT:
+   If you are about to classify this as "out_of_scope", re-read your own CONDENSED/reason text. If it contains (or would contain) phrasing like "without specifying", "does not specify", "no frequency band/channels/condition/metric given or specified", "missing parameters", or any similar justification based on ABSENCE of a parameter — that reasoning is INVALID and FORBIDDEN. Discard it and reclassify as "eeg_analysis" instead. A request about this EEG dataset or pipeline with zero parameters (e.g. "show me an overview plot", "what channels does this dataset have", "give me the dataset info") is still "eeg_analysis" — it is simply a request the Supervisor can fully satisfy without needing any of the 3 mandatory axes resolved.
+   The ONLY valid basis for "out_of_scope" is that the request's SUBJECT MATTER has nothing to do with this EEG dataset or pipeline at all (weather, jokes, general knowledge, unrelated coding help, etc.) — never that it lacks parameters.
 
 OUTPUT FORMAT — respond with EXACTLY this 4-line structure, no extra text before or after:
 
@@ -149,7 +158,24 @@ Output:
 INTENT: eeg_analysis
 CONDENSED: compute PLI for alpha band on F3, F4 during task
 CONTRADICTION: none
-CLARIFICATION: none\
+CLARIFICATION: none
+
+--- Example 9: Parameter-less request (not out-of-scope) ---
+Input: "show me an overview plot of this dataset"
+Output:
+INTENT: eeg_analysis
+CONDENSED: show me an overview plot of this dataset
+CONTRADICTION: none
+CLARIFICATION: none
+
+--- Example 10: Another parameter-less request — dataset inspection, not analysis ---
+Input: "what channels does this dataset have?"
+Output:
+INTENT: eeg_analysis
+CONDENSED: what channels does this dataset have?
+CONTRADICTION: none
+CLARIFICATION: none
+(WRONG reasoning to avoid here: "out_of_scope — request does not specify a frequency band or condition." Absence of parameters is never a valid reason for out_of_scope. This is a dataset-inspection request about THIS pipeline's own dataset, which is squarely in scope.)\
 """
 
 
@@ -254,7 +280,12 @@ def transform_query(
     ]
 
     try:
-        response = llm.invoke(messages)
+        with trace_span(
+            name="query_transformer",
+            span_type="LLM",
+            inputs={"accumulated_query": accumulated_query},
+        ):
+            response = llm.invoke(messages)
         raw_text = response.content if hasattr(response, "content") else str(response)
     except Exception:
         logger.exception("Query transformer LLM call failed — falling back to raw passthrough")

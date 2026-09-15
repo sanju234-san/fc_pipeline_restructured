@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chainlit as cl
+
+logger = logging.getLogger(__name__)
+
+
+def _trace_span(name: str, span_type: str = "TOOL", inputs: Optional[Dict[str, Any]] = None):
+    """Create a child MLflow span; degrades to a no-op if tracing is unavailable.
+
+    Delegates to the shared helper in observability.mlflow_tracker so the (subtle)
+    correct-API handling lives in exactly one place. See that helper for why
+    `inputs` cannot be passed straight to mlflow.start_span().
+    """
+    try:
+        from fc_pipeline.observability.mlflow_tracker import trace_span as _shared
+        return _shared(name=name, span_type=span_type, inputs=inputs)
+    except Exception:
+        return nullcontext()
+
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(SRC_DIR) not in sys.path:
@@ -131,7 +150,7 @@ def format_manifest_markdown(manifest: Optional[List[ParameterManifestEntry]]) -
         risk_str = (
             f"**{entry.risk_tier.upper()}**" if entry.risk_tier == "elevated" else entry.risk_tier
         )
-        val_str = str(entry.proposed_value).replace("|", "\\|")
+        val_str = mask_text(str(entry.proposed_value)).replace("|", "\\|")
         approved_str = mask_text(entry.human_approved_value) if entry.human_approved_value else "—"
         lines.append(
             f"| `{entry.name}` | {entry.category} | {val_str} | {conf_str} | {human_str} | {risk_str} | {approved_str} |"
@@ -316,6 +335,8 @@ def _build_graph_state(user_request: str, run_id: str) -> GraphState:
         "parameter_manifest": None,
         "preflight_confirmed": False,
         "clarification_question": None,
+        "informational_response": None,
+        "informational_artifacts": None,
         "bad_channels_dropped": None,
         "channel_plot_paths": None,
         "preprocessed_data_path": None,
@@ -411,6 +432,7 @@ def _run_pipeline_sync(
 
 
 @cl.on_message
+@mlflow.trace(name="chainlit_on_message", span_type="CHAIN")
 async def on_message(message: cl.Message):
     counter = cl.user_session.get("counter", 0) + 1
     cl.user_session.set("counter", counter)
@@ -517,11 +539,17 @@ async def on_message(message: cl.Message):
         await transformer_msg.update()
         # Use the condensed query for the Supervisor
         effective_query = condensed
+        # Persist for skip-transformer re-validation paths (request_changes,
+        # scientific_axis edits) so those start from the same condensed
+        # intent, not a potentially large accumulated_query.
+        cl.user_session.set("condensed_query", condensed)
     else:
         # Transformer failed entirely — pass raw accumulated query
         transformer_msg.content = "🔄 Proceeding with your request…"
         await transformer_msg.update()
         effective_query = accumulated_query
+        # No condensed available — revision paths will fall back to original_query
+        cl.user_session.set("condensed_query", None)
 
     # Set base_run_id if starting a fresh sequence
     if cl.user_session.get("base_run_id") is None:
@@ -558,6 +586,69 @@ def _reset_conversation_state():
     cl.user_session.set("accumulated_query", None)
     cl.user_session.set("base_run_id", None)
     cl.user_session.set("gate_1_revision", 0)
+    cl.user_session.set("condensed_query", None)
+
+
+def _prepare_revision_run(current_run_id: str) -> tuple[str, str, int, Dict[str, Any]]:
+    """Compute the next revision's run_id + MLflow tags + update session counters.
+
+    Shared by (1) scientific-axis per-row edit re-validation, and
+    (2) standalone Request Changes button re-validation. Ensures lineage
+    (base_run_id / revision counter / suffixed run_id) cannot drift between
+    the two code paths.
+
+    Returns: (base_run_id, next_run_id, rev_counter, mlflow_tags_dict)
+    """
+    base_run_id = cl.user_session.get("base_run_id") or current_run_id
+    cl.user_session.set("base_run_id", base_run_id)
+    rev_counter = cl.user_session.get("gate_1_revision", 0) + 1
+    cl.user_session.set("gate_1_revision", rev_counter)
+    next_run_id = f"{base_run_id}_rev{rev_counter}"
+    tags = {
+        "scenario_id": next_run_id,
+        "parent_scenario_id": base_run_id,
+        "revision": rev_counter,
+    }
+    return base_run_id, next_run_id, rev_counter, tags
+
+
+def _build_revision_query(change_feedback: str) -> str:
+    """Build the re-validation query for a revision run.
+
+    Skip query transformer per spec (intent already unambiguous). Start from
+    session.stored condensed_query (if present) so re-validation uses the
+    same condensed intent as the original Supervisor pass, not a potentially
+    large accumulated_query string. Fall back to original_query if
+    condensed_query is absent (e.g. original transformer failed entirely).
+
+    KNOWN EDGE CASE (condensed_query staleness across chained revisions):
+    condensed_query is written once per plain on_message() call, from the
+    query transformer's condensed output. Inside the Gate 1 HITL loop, any
+    revision (standalone Request Changes OR scientific-axis per-row edit)
+    skips the transformer and therefore does NOT re-condense the resulting
+    updated intent. If the user chains revision N → reaches Gate 1 again
+    → then triggers revision N+1 within the same turn, the condensed_query
+    prefix on revision N+1 will still reflect the pre-revision-N condensed
+    intent. The revision-N feedback is preserved as the *previous*
+    "[User Gate 1 Change Request]" line ONLY IF it was captured into the
+    user_request string that the Supervisor re-processed. However: any
+    intent change introduced *only* via revision-N feedback and NOT
+    re-incorporated back into condensed_query via a plain on_message call
+    will appear in revision N+1's query string ONLY if it's part of the
+    accumulated state the Supervisor re-emits in its plan. This is the
+    explicit contract of the skip-transformer design — revising a revision
+    loses the condensation property between hops, but never loses the
+    raw feedback text (it's in the change_feedback arg passed here). If
+    chained revisions become a common workflow, the correct fix is to
+    re-enable the query transformer on revision runs, overriding the
+    current "skip transformer per spec" rule for N >= 2 only.
+    """
+    condensed = cl.user_session.get("condensed_query")
+    if not condensed:
+        condensed = cl.user_session.get("original_query") or ""
+    if condensed:
+        return f"{condensed}\n[User Gate 1 Change Request]: {change_feedback}"
+    return f"[User Gate 1 Change Request]: {change_feedback}"
 
 
 def _snapshot_overrides(
@@ -739,32 +830,72 @@ async def _handle_pipeline_output(
         await msg.update()
         return
 
+    if "informational_complete" in routed_node:
+        # Request fully satisfied by informational/diagnostic tools alone
+        # (e.g. a bare overview plot, or "what conditions does this
+        # dataset have") — no AnalysisPlan was needed, nothing to gate,
+        # nothing further to ask. Distinct from both clarification_pause
+        # (genuinely missing info) and gate_1_review (needs plan approval).
+        cl.user_session.set("awaiting_clarification", False)
+
+        info_text = output_state.get("informational_response") or "Request completed."
+        body = [
+            "## ℹ️ Request Completed",
+            "",
+            "### Node Result Summary",
+            summary_text,
+            "",
+            mask_text(info_text),
+            "",
+            "---",
+            f"_Routed node_: `{routed_node}`",
+        ]
+        msg.content = "\n".join(body)
+        await msg.update()
+
+        # Same deterministic overview-plot lookup convention as the Gate 1
+        # branch below — generate_dataset_overview_plot always writes to
+        # outputs/plots/{run_id}_overview.png, regardless of exactly what
+        # keys its own observation dict happens to return, so we don't need
+        # to parse informational_artifacts to find it.
+        overview_plot = Path("outputs") / "plots" / f"{run_id}_overview.png"
+        if overview_plot.exists():
+            image = cl.Image(
+                path=str(overview_plot),
+                name="Dataset Overview",
+                display="inline",
+            )
+            await cl.Message(
+                content="### Dataset Overview Plot",
+                elements=[image],
+            ).send()
+        return
+
     if "gate_1_review" in routed_node:
         cl.user_session.set("awaiting_clarification", False)
 
-        # Store the live manifest in session so edits persist across the
-        # edit→re-render loop within a single Gate 1 turn.
-        cl.user_session.set("gate_1_manifest", manifest)
+        # Overview plot is static for the whole Gate 1 turn — render it once
+        # before the edit loop, not once per iteration.
+        overview_plot = Path("outputs") / "plots" / f"{run_id}_overview.png"
+        if overview_plot.exists():
+            image = cl.Image(
+                path=str(overview_plot),
+                name="Dataset Overview",
+                display="inline",
+            )
+            await cl.Message(
+                content="### Dataset Overview Plot",
+                elements=[image],
+            ).send()
 
         # --- Gate 1 HITL loop (edit → re-render → action) ---
         # Uses a while loop so multiple sequential edits stay in the same
         # turn without recursive calls into _handle_pipeline_output.
         while True:
-            # (Re-)build and render the Gate 1 card
+            # (Re-)build and render the Gate 1 card (reflects edits made on
+            # prior iterations via the manifest closure reference).
             msg.content = _build_gate_1_card(run_id, summary_text, plan, manifest, routed_node)
             await msg.update()
-
-            overview_plot = Path("outputs") / "plots" / f"{run_id}_overview.png"
-            if overview_plot.exists():
-                image = cl.Image(
-                    path=str(overview_plot),
-                    name="Dataset Overview",
-                    display="inline",
-                )
-                await cl.Message(
-                    content="### Dataset Overview Plot",
-                    elements=[image],
-                ).send()
 
             # Build combined action list (edit buttons + Approve/Request Changes/Reject)
             actions = _build_gate_1_actions(manifest)
@@ -792,33 +923,50 @@ async def _handle_pipeline_output(
 
             # --- Approve ---
             if chosen_action == "approve":
-                # Re-log the final manifest (with any human_approved_value edits) to MLflow
-                try:
-                    mlflow_tracker.log_manifest(manifest)
-                except Exception:
-                    pass
-                _reset_conversation_state()
-                cl.user_session.set("gate_1_approved", True)
-                await cl.Message(
-                    content=(
-                        "### ✅ Gate 1 Approved\n\n"
-                        "Manifest validated and locked. Ready to proceed to **Node 2 (Data Preparation)**.\n\n"
-                        "*(Note: Nodes 2–5 are currently scaffolded stubs.)*"
-                    )
-                ).send()
+                with _trace_span(
+                    name="gate_1_action_approve",
+                    span_type="TOOL",
+                    inputs={"run_id": run_id, "manifest_entry_count": len(manifest or [])},
+                ) as _s:
+                    # Re-log the final manifest (with any human_approved_value edits) to MLflow
+                    try:
+                        mlflow_tracker.log_manifest(manifest)
+                    except Exception as e:
+                        logger.warning(
+                            "MLflow log_manifest failed during Gate 1 Approve (post-edit artifact): %s: %s",
+                            type(e).__name__, e,
+                        )
+                    _reset_conversation_state()
+                    cl.user_session.set("gate_1_approved", True)
+                    await cl.Message(
+                        content=(
+                            "### ✅ Gate 1 Approved\n\n"
+                            "Manifest validated and locked. Ready to proceed to **Node 2 (Data Preparation)**.\n\n"
+                            "*(Note: Nodes 2–5 are currently scaffolded stubs.)*"
+                        )
+                    ).send()
+                    if _s is not None:
+                        _s.set_outputs({"gate_1_approved": True})
                 return
 
             # --- Reject ---
             elif chosen_action == "reject":
-                _reset_conversation_state()
-                cl.user_session.set("gate_1_approved", False)
-                await cl.Message(
-                    content=(
-                        "### 🛑 Gate 1 Rejected\n\n"
-                        "Pipeline run aborted without executing downstream nodes. "
-                        "Type a new query or `new query: …` to start fresh."
-                    )
-                ).send()
+                with _trace_span(
+                    name="gate_1_action_reject",
+                    span_type="TOOL",
+                    inputs={"run_id": run_id},
+                ) as _s:
+                    _reset_conversation_state()
+                    cl.user_session.set("gate_1_approved", False)
+                    await cl.Message(
+                        content=(
+                            "### 🛑 Gate 1 Rejected\n\n"
+                            "Pipeline run aborted without executing downstream nodes. "
+                            "Type a new query or `new query: …` to start fresh."
+                        )
+                    ).send()
+                    if _s is not None:
+                        _s.set_outputs({"gate_1_approved": False})
                 return
 
             # --- Per-row Edit ---
@@ -875,16 +1023,18 @@ async def _handle_pipeline_output(
                         await cl.Message(content="⚠️ No value provided — edit cancelled.").send()
                         continue  # Re-render
 
-                    # Route through Request Changes path (skip transformer)
-                    current_accumulated = cl.user_session.get("accumulated_query", "")
-                    new_accumulated = f"{current_accumulated}\n[User Gate 1 Change Request]: Change {entry_name} to {edit_value}"
-                    cl.user_session.set("accumulated_query", new_accumulated)
+                    # Skip query transformer per spec (intent already unambiguous).
+                    # Shared helpers keep lineage counters in sync with the
+                    # standalone Request Changes path.
+                    feedback = f"Change {entry_name} to {edit_value}"
+                    revision_query = _build_revision_query(feedback)
+                    base_run_id, next_run_id, rev_counter, rev_tags = _prepare_revision_run(run_id)
 
-                    base_run_id = cl.user_session.get("base_run_id") or run_id
-                    cl.user_session.set("base_run_id", base_run_id)
-                    rev_counter = cl.user_session.get("gate_1_revision", 0) + 1
-                    cl.user_session.set("gate_1_revision", rev_counter)
-                    next_run_id = f"{base_run_id}_rev{rev_counter}"
+                    # Also keep accumulated_query updated for any follow-up
+                    # plain messages that route through on_message's else-branch
+                    current_accumulated = cl.user_session.get("accumulated_query", "")
+                    new_accumulated = f"{current_accumulated}\n[User Gate 1 Change Request]: {feedback}"
+                    cl.user_session.set("accumulated_query", new_accumulated)
 
                     re_msg = cl.Message(
                         content=f"🔄 `{mask_text(entry_name)}` requires Supervisor re-validation — re-invoking with: *'{mask_text(edit_value)}'*…"
@@ -892,15 +1042,26 @@ async def _handle_pipeline_output(
                     await re_msg.send()
 
                     try:
-                        new_state, new_nodes = await cl.make_async(_run_pipeline_sync)(
-                            new_accumulated,
-                            next_run_id,
-                            tags={
-                                "scenario_id": next_run_id,
-                                "parent_scenario_id": base_run_id,
+                        with _trace_span(
+                            name="revision_supervisor_rerun_scientific_edit",
+                            span_type="CHAIN",
+                            inputs={
+                                "entry_name": entry_name,
+                                "edit_value": edit_value[:100],
                                 "revision": rev_counter,
+                                "next_run_id": next_run_id,
                             },
-                        )
+                        ) as _rev_span:
+                            new_state, new_nodes = await cl.make_async(_run_pipeline_sync)(
+                                revision_query,
+                                next_run_id,
+                                tags=rev_tags,
+                            )
+                            if _rev_span is not None:
+                                _rev_span.set_outputs({
+                                    "routed_node": new_state.get("_routed_node", ""),
+                                    "manifest_entries": len(new_state.get("parameter_manifest") or []),
+                                })
                     except Exception as e:
                         err = f"**Pipeline execution failed during re-run**: `{type(e).__name__}: {e}`"
                         await cl.Message(content=mask_text(err)).send()
@@ -949,7 +1110,14 @@ async def _handle_pipeline_output(
                     continue  # Re-render
 
                 # Write directly to human_approved_value — no Supervisor round-trip
-                target_entry.human_approved_value = edit_value
+                with _trace_span(
+                    name="gate_1_direct_edit_advisory",
+                    span_type="TOOL",
+                    inputs={"entry_name": entry_name, "category": target_entry.category},
+                ) as _s:
+                    target_entry.human_approved_value = edit_value
+                    if _s is not None:
+                        _s.set_outputs({"approved_value_preview": edit_value[:50]})
                 await cl.Message(
                     content=f"✅ `{mask_text(entry_name)}` approved value set to: *{mask_text(edit_value)}*"
                 ).send()
@@ -986,34 +1154,43 @@ async def _handle_pipeline_output(
                 # Snapshot existing overrides before Supervisor re-run
                 prior_overrides = _snapshot_overrides(manifest)
 
-                # Append change request directly to accumulated_query
+                # Skip query transformer per spec (intent already unambiguous).
+                # Shared helpers keep lineage counters in sync with the
+                # scientific-axis per-row edit path.
+                revision_query = _build_revision_query(feedback_text)
+                base_run_id, next_run_id, rev_counter, rev_tags = _prepare_revision_run(run_id)
+
+                # Also keep accumulated_query updated for any follow-up
+                # plain messages that route through on_message's else-branch
                 current_accumulated = cl.user_session.get("accumulated_query", "")
                 new_accumulated = f"{current_accumulated}\n[User Gate 1 Change Request]: {feedback_text}"
                 cl.user_session.set("accumulated_query", new_accumulated)
-
-                # Suffix run_id and track lineage in MLflow
-                base_run_id = cl.user_session.get("base_run_id") or run_id
-                cl.user_session.set("base_run_id", base_run_id)
-                rev_counter = cl.user_session.get("gate_1_revision", 0) + 1
-                cl.user_session.set("gate_1_revision", rev_counter)
-                next_run_id = f"{base_run_id}_rev{rev_counter}"
 
                 re_msg = cl.Message(
                     content=f"🔄 Applying requested changes: *'{mask_text(feedback_text)}'* — Re-invoking Supervisor Agent…"
                 )
                 await re_msg.send()
 
-                # Skip query transformer on this path, feed directly to Supervisor
                 try:
-                    new_state, new_nodes = await cl.make_async(_run_pipeline_sync)(
-                        new_accumulated,
-                        next_run_id,
-                        tags={
-                            "scenario_id": next_run_id,
-                            "parent_scenario_id": base_run_id,
+                    with _trace_span(
+                        name="revision_supervisor_rerun_request_changes",
+                        span_type="CHAIN",
+                        inputs={
+                            "feedback_text": feedback_text[:200],
                             "revision": rev_counter,
+                            "next_run_id": next_run_id,
                         },
-                    )
+                    ) as _rev_span:
+                        new_state, new_nodes = await cl.make_async(_run_pipeline_sync)(
+                            revision_query,
+                            next_run_id,
+                            tags=rev_tags,
+                        )
+                        if _rev_span is not None:
+                            _rev_span.set_outputs({
+                                "routed_node": new_state.get("_routed_node", ""),
+                                "manifest_entries": len(new_state.get("parameter_manifest") or []),
+                            })
                 except Exception as e:
                     err = f"**Pipeline execution failed during re-run**: `{type(e).__name__}: {e}`"
                     await cl.Message(content=mask_text(err)).send()
