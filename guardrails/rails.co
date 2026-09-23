@@ -1,0 +1,9 @@
+# Colang rail definitions for the EEG functional-connectivity pipeline.
+#
+# The input rail ("self check input") and output rail ("self check facts") are
+# NeMo Guardrails library flows enabled in config.yml; their decision policies
+# are the prompts in prompts.yml. This file holds the shared refusal message
+# used when a rail blocks and rails exceptions are disabled.
+
+define bot refuse to respond
+  "I'm sorry, I can't respond to that."

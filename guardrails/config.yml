@@ -1,0 +1,23 @@
+# NVIDIA NeMo Guardrails configuration — loaded via RailsConfig.from_path("guardrails").
+#
+# The main LLM is NOT declared here: the pipeline passes its existing
+# Supervisor LLM (SUPERVISOR_LLM_ENDPOINT / _MODEL / _API_KEY) to LLMRails at
+# runtime, so Groq / vLLM handling stays in llm_provider.py.
+#
+# This layer sits at the input/output boundary only. It does not replace or
+# touch the deterministic domain-science guardrails (thresholds.py,
+# matrix_checks.py, zero-guessing / synthesis-advisory logic in the Supervisor).
+colang_version: "1.0"
+
+rails:
+  input:
+    flows:
+      # Jailbreak / prompt-injection detection + off-topic (non-EEG) rejection.
+      # The policy lives in prompts.yml (task: self_check_input).
+      - self check input
+  output:
+    flows:
+      # Fact-consistency: is the response entailed by the tool observations?
+      # Requires $check_facts and $relevant_chunks, supplied per call by
+      # fc_pipeline.pipeline.nodes (context message). Policy: task self_check_facts.
+      - self check facts
