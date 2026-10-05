@@ -105,22 +105,32 @@ def generate_diagnostics(
             fmax=min(params.fmax * 2.0, epochs.info["sfreq"] / 2.0 - 0.1),
             verbose=False,
         )
-        psds = spectrum.get_data()  # (n_epochs, n_channels, n_freqs)
-        freqs = spectrum.freqs
 
-        # Average across epochs, plot each channel
-        mean_psds = psds.mean(axis=0)  # (n_channels, n_freqs)
-        for i, ch_name in enumerate(epochs.ch_names):
-            ax.semilogy(freqs, mean_psds[i], linewidth=0.8, alpha=0.7, label=ch_name)
+        # Native MNE plotting call
+        spectrum.plot(average=False, spatial_colors=False, axes=ax, show=False)
 
         # Highlight the analysis frequency band
         ax.axvspan(params.fmin, params.fmax, alpha=0.15, color="orange", label="Analysis band")
-        ax.set_xlabel("Frequency (Hz)")
-        ax.set_ylabel("PSD (V²/Hz)")
         ax.set_title(
             f"Power Spectral Density — {params.condition} "
             f"({len(epochs)} epochs)"
         )
+
+        # Distinguish channels by color and label for the legend
+        n_freqs = len(spectrum.freqs)
+        ch_lines = [line for line in ax.lines if len(line.get_xdata()) == n_freqs]
+        if len(ch_lines) == len(epochs.ch_names):
+            cmap = matplotlib.colormaps["tab10" if len(epochs.ch_names) <= 10 else "tab20"]
+            for i, (line, ch_name) in enumerate(zip(ch_lines, epochs.ch_names)):
+                line.set_color(cmap(i % cmap.N))
+                line.set_label(ch_name)
+        else:
+            logger.warning(
+                "Expected %d channel curves from Spectrum.plot, but found %d",
+                len(epochs.ch_names),
+                len(ch_lines),
+            )
+
         # Place legend outside if many channels
         if len(epochs.ch_names) <= 10:
             ax.legend(fontsize=7, loc="upper right")
