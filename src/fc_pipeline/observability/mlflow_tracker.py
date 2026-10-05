@@ -43,8 +43,16 @@ def mask_sensitive_value(key: str, val: Any) -> Any:
         user = os.getenv("USERNAME") or os.getenv("USER") or ""
         if user:
             cleaned = re.sub(re.escape(user), "[MASKED_USER]", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"[A-Za-z]:\\Users\\[^\\]+\\", "[LOCAL_ROOT]/", cleaned)
-        cleaned = re.sub(r"/(?:home|Users)/[^/]+/", "[LOCAL_ROOT]/", cleaned)
+        cleaned = re.sub(
+            r"(?:[A-Za-z]:)?(?:\\[^\\\r\n]+)+\\(?P<file>[^\\\r\n]*)",
+            lambda m: f"[LOCAL_ROOT]/{m.group('file') or ''}",
+            cleaned,
+        )
+        cleaned = re.sub(
+            r"(?<![\w/])/(?:[^/\s]+/)+(?P<file>[^/\s]*)",
+            lambda m: f"[LOCAL_ROOT]/{m.group('file') or ''}",
+            cleaned,
+        )
         # Original endpoint masking
         if "groq.com" in cleaned.lower():
             return "https://api.groq.com/openai/v1"

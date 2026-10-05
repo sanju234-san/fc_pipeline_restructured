@@ -2,8 +2,25 @@
 
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
+
+
+_EVENT_SINK: ContextVar[Optional[Callable[[Dict[str, Any]], None]]] = ContextVar(
+    "supervisor_event_sink", default=None
+)
+
+
+@contextmanager
+def supervisor_event_sink(sink: Optional[Callable[[Dict[str, Any]], None]]):
+    """Temporarily mirror tracer events to a UI sink without polluting GraphState."""
+    token = _EVENT_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _EVENT_SINK.reset(token)
 
 
 class SupervisorTracer:
@@ -17,10 +34,19 @@ class SupervisorTracer:
         self.log_dir = log_dir
         self.file_path = os.path.join(self.log_dir, f"trace_{self.run_id}.json")
         self.events: List[Dict[str, Any]] = []
-        
-        # Ensure log directory exists immediately
+
+        # Reuse an existing run trace when a downstream stage (e.g. Data Prep)
+        # emits additional events after the Supervisor has already logged.
         os.makedirs(self.log_dir, exist_ok=True)
-        self._flush_to_disk()
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                self.events = list(existing.get("events") or [])
+            except Exception:
+                self.events = []
+        else:
+            self._flush_to_disk()
 
     def log_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Records a single reasoning step, tool call, observation, or decision and flushes to disk."""
@@ -31,6 +57,13 @@ class SupervisorTracer:
         }
         self.events.append(event_entry)
         self._flush_to_disk()
+        sink = _EVENT_SINK.get()
+        if sink is not None:
+            try:
+                sink(event_entry)
+            except Exception:
+                # UI streaming must never break the scientific pipeline.
+                pass
 
     def _flush_to_disk(self) -> None:
         """Serializes current trace history to logs/trace_<run_id>.json."""

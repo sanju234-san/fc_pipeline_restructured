@@ -17,7 +17,26 @@ class GraphState(TypedDict):
     latest_user_message: Optional[str]
 
     # 1. Supervisor Outputs
+    # ONE authoritative HITL payload (see schemas/clarification.py). The flat
+    # clarification_* fields below are derived from it and kept for compatibility.
+    clarification: Optional[Dict[str, Any]]
     clarification_question: Optional[str]
+    clarification_kind: Optional[str]
+    clarification_options: Optional[List[Dict[str, str]]]
+    condition_candidates: Optional[List[str]]
+    clarification_response: Optional[str]
+    clarification_resume_kind: Optional[str]
+    # Persist successfully resolved Supervisor axes across HITL resumes so a
+    # later clarification cannot cause an already-approved axis to be asked again.
+    resolved_frequency_band_info: Optional[Dict[str, Any]]
+    resolved_channel_info: Optional[Dict[str, Any]]
+    resolved_condition_value: Optional[str]
+    # Dataset metadata discovered by Supervisor and persisted across HITL resumes.
+    # These fields keep bounded HITL choices available after a native LangGraph interrupt.
+    dataset_sfreq: Optional[float]
+    dataset_duration_seconds: Optional[float]
+    dataset_available_channels: Optional[List[str]]
+    dataset_reference: Optional[str]
     plan: Optional[AnalysisPlan]
     parameter_manifest: Optional[List[ParameterManifestEntry]]
     preflight_confirmed: bool
@@ -55,6 +74,7 @@ class GraphState(TypedDict):
     channel_plot_paths: Optional[Dict[str, str]]
     preprocessed_data_path: Optional[str]
     data_prep_error: Optional[str]
+    data_prep_summary: Optional[Any]
 
     # 3. Connectivity Analysis Outputs (Placeholders for Node 3)
     metric_csv_paths: Optional[Dict[str, str]]

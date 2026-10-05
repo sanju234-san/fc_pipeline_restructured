@@ -10,6 +10,7 @@ from fc_pipeline.schemas.enums import MetricEnum
 from fc_pipeline.schemas.manifest import ParameterManifestEntry
 from fc_pipeline.schemas.plan import AnalysisPlan, FrequencyBand
 from fc_pipeline.schemas.state import GraphState
+from fc_pipeline.schemas.clarification import AXIS_KINDS, build_clarification, legacy_fields
 from fc_pipeline.config.metric_canonicalization import METRIC_LOOKUP
 from fc_pipeline.config.thresholds import (
     SUPERVISOR_CONFIDENCE_THRESHOLD,
@@ -28,8 +29,12 @@ from fc_pipeline.agentic.supervisor.tool_call_parser import extract_mistral_styl
 from fc_pipeline.observability.mlflow_tracker import trace_span
 from fc_pipeline.agentic.supervisor.tools.dataset_info import get_dataset_info
 from fc_pipeline.agentic.supervisor.tools.dataset_conditions import get_dataset_conditions
-from fc_pipeline.agentic.supervisor.tools.frequency_band import resolve_frequency_band
-from fc_pipeline.agentic.supervisor.tools.channel_selection import resolve_channel_selection
+from fc_pipeline.agentic.supervisor.tools.frequency_band import resolve_frequency_band, CANONICAL_BANDS
+from fc_pipeline.agentic.supervisor.tools.channel_selection import (
+    resolve_channel_selection,
+    REGION_MAP,
+    normalize_channel_label,
+)
 from fc_pipeline.agentic.supervisor.tools.dataset_overview_plot import generate_dataset_overview_plot
 
 
@@ -416,6 +421,115 @@ def compile_and_confirm_manifest(
     return manifest, None
 
 
+def _condition_candidates_from_request(user_request: str, conditions: List[str]) -> List[str]:
+    """Return all dataset conditions mentioned in the active request.
+
+    This is intentionally conservative: if multiple labels are present, the
+    UI can present them as explicit human choices instead of asking the user
+    to retype exact event labels.
+    """
+    norm = lambda s: re.sub(r"\s+", " ", s.strip().lower())
+    window = norm(_condition_search_window(user_request))
+    matches: List[Tuple[int, str]] = []
+    for cond in conditions:
+        c = norm(cond)
+        pattern = r"(?<![A-Za-z0-9_])" + re.escape(c) + r"(?![A-Za-z0-9_])"
+        m = re.search(pattern, window)
+        if m:
+            matches.append((m.start(), cond))
+    matches.sort(key=lambda x: x[0])
+    return [c for _, c in matches]
+
+
+def _valid_frequency_band_options(sfreq: Optional[float], duration_seconds: Optional[float]) -> List[Dict[str, str]]:
+    """Build bounded canonical-band buttons that pass deterministic validation."""
+    options: List[Dict[str, str]] = []
+    if not sfreq or sfreq <= 0:
+        return options
+    nyquist = sfreq / 2.0
+    for name, bounds in CANONICAL_BANDS.items():
+        if bounds["fmax"] >= nyquist:
+            continue
+        if duration_seconds and duration_seconds > 0:
+            # Same minimum-cycle rule as resolve_frequency_band, without invoking
+            # the tool solely to construct UI choices.
+            if duration_seconds < MIN_CYCLES / bounds["fmin"]:
+                continue
+        options.append({
+            "name": name,
+            "value": name,
+            "label": f"{name.title()} ({bounds['fmin']:.0f}–{bounds['fmax']:.0f} Hz)",
+        })
+    return options
+
+
+def _channel_options(available_channels: Optional[List[str]], max_buttons: int = 12) -> List[Dict[str, str]]:
+    """Build deterministic bounded EEG channel HITL choices.
+
+    The UI must *always* have a bounded choice when the dataset exposes a
+    usable electrode list.  Small datasets get representative channel-pair
+    buttons; larger datasets get anatomical-region buttons backed by the
+    actual electrode labels.  Normalisation intentionally mirrors
+    ``resolve_channel_selection`` so labels such as ``EEG F3-REF`` and
+    ``Fp1`` are recognised consistently.
+    """
+    channels = [str(ch).strip() for ch in (available_channels or []) if str(ch).strip()]
+    if len(channels) < 2:
+        return []
+
+    clean_to_raw: Dict[str, str] = {}
+    for raw in channels:
+        clean_to_raw.setdefault(normalize_channel_label(raw), raw)
+
+    # For small electrode sets, show actual pairs from the dataset.
+    if len(channels) <= max_buttons:
+        options: List[Dict[str, str]] = []
+        for i in range(0, len(channels) - 1, 2):
+            pair = channels[i:i + 2]
+            if len(pair) == 2:
+                options.append({
+                    "name": f"channels_{i}",
+                    "value": ", ".join(pair),
+                    "label": f"{pair[0]} + {pair[1]}",
+                })
+        return options
+
+    # For larger datasets, use the same anatomical map as the resolver.
+    # A region button is only emitted if at least two *real* electrodes from
+    # that region exist in this dataset.
+    options: List[Dict[str, str]] = []
+    seen_regions = set()
+    for region, region_channels in REGION_MAP.items():
+        matched = [clean_to_raw[ch] for ch in region_channels if ch in clean_to_raw]
+        if len(matched) >= 2 and region not in seen_regions:
+            seen_regions.add(region)
+            preview_names = [normalize_channel_label(ch) for ch in matched[:4]]
+            preview = ", ".join(preview_names)
+            if len(matched) > 4:
+                preview += "…"
+            options.append({
+                "name": f"region_{region}",
+                "value": region,
+                "label": f"{region.title()} region ({preview})",
+            })
+
+    # If the dataset uses a standard EEG montage but its exact labels do not
+    # map to REGION_MAP (e.g. extended 10-10 names), still provide bounded
+    # electrode-pair choices from the actual data. Never invent labels.
+    if not options:
+        usable = list(clean_to_raw.items())
+        for i in range(0, min(len(usable), 12), 2):
+            pair = usable[i:i + 2]
+            if len(pair) == 2:
+                options.append({
+                    "name": f"electrodes_{i}",
+                    "value": f"{pair[0][1]}, {pair[1][1]}",
+                    "label": f"{normalize_channel_label(pair[0][1])} + {normalize_channel_label(pair[1][1])}",
+                })
+
+    return options
+
+
 def supervisor_node(
     state: GraphState,
     llm: BaseChatModel,
@@ -444,20 +558,101 @@ def supervisor_node(
     ]
 
     tool_confidences: Dict[str, float] = {}
-    resolved_band_info: Optional[Dict[str, Any]] = None
-    resolved_channel_info: Optional[Dict[str, Any]] = None
-    resolved_condition: Optional[str] = None
+    # Carry successful axis resolutions across native HITL resumes. The prior
+    # implementation recreated these locals on every clarification response,
+    # which made an already-valid selection (e.g. Theta) appear unresolved.
+    resolved_band_info: Optional[Dict[str, Any]] = state.get("resolved_frequency_band_info")
+    resolved_channel_info: Optional[Dict[str, Any]] = state.get("resolved_channel_info")
+    resolved_condition: Optional[str] = state.get("resolved_condition_value")
+    if resolved_band_info and "confidence" in resolved_band_info:
+        tool_confidences["frequency_band"] = resolved_band_info["confidence"]
+    if resolved_channel_info and "confidence" in resolved_channel_info:
+        tool_confidences["channels"] = resolved_channel_info["confidence"]
+    if resolved_condition:
+        tool_confidences["condition"] = 1.0
     resolved_trial_count: Optional[int] = None
     resolved_condition_counts: Dict[str, int] = {}
+    conditions_tool_called = False
     clarification_question: Optional[str] = None
+    clarification_kind: Optional[str] = None
+    clarification_options: List[Dict[str, str]] = []
+    condition_candidates: List[str] = []
     attempted_frequency_band: bool = False
     attempted_channel_selection: bool = False
+    last_band_error: Optional[str] = None
+    last_unresolved_channels: List[str] = []
     informational_tool_outputs: Dict[str, Any] = {}
+    # Keep dataset metadata available across native HITL interrupts so the UI
+    # can always build bounded choices from the actual loaded EEG.
+    dataset_sfreq = state.get("dataset_sfreq")
+    dataset_duration_seconds = state.get("dataset_duration_seconds")
+    dataset_available_channels = state.get("dataset_available_channels")
+    dataset_reference = state.get("dataset_reference")
+
     loop_exhausted: bool = True
     response: Optional[AIMessage] = None  # sentinel; guards post-loop `response and ...` checks
 
+    def _direct_tool(t_name: str, t_args: Dict[str, Any]) -> Dict[str, Any]:
+        """Deterministic (non-LLM) tool call with the same trace events as the ReAct loop."""
+        tracer.log_event("tool_call", {"tool": t_name, "args": t_args})
+        try:
+            with trace_span(name=f"tool:{t_name}", span_type="TOOL", inputs={"tool": t_name, "args": t_args}):
+                obs = TOOL_MAP[t_name].invoke(t_args)
+        except Exception as exc:  # never let UI-support lookups crash the halt
+            obs = {"error": f"{type(exc).__name__}: {exc}"}
+        tracer.log_event("tool_observation", {"tool": t_name, "observation": obs})
+        return obs
+
+    def _capture_dataset_info(obs: Dict[str, Any]) -> None:
+        nonlocal dataset_sfreq, dataset_duration_seconds, dataset_available_channels, dataset_reference
+        if not isinstance(obs, dict):
+            return
+        if obs.get("duration_seconds", 0) and obs["duration_seconds"] > 0:
+            dataset_duration_seconds = obs["duration_seconds"]
+        if obs.get("sfreq", 0) and obs["sfreq"] > 0:
+            dataset_sfreq = obs["sfreq"]
+        if obs.get("available_channels"):
+            dataset_available_channels = obs["available_channels"]
+        if obs.get("reference"):
+            dataset_reference = obs["reference"]
+
+    def _capture_conditions(obs: Dict[str, Any], resolve: bool = True) -> None:
+        nonlocal conditions_tool_called, resolved_condition_counts, resolved_trial_count
+        nonlocal condition_candidates, resolved_condition
+        if not (isinstance(obs, dict) and "conditions" in obs):
+            return
+        conditions_tool_called = True
+        resolved_condition_counts = obs["conditions"]
+        if resolved_trial_count is None and "total_trials" in obs:
+            resolved_trial_count = obs["total_trials"]
+        condition_candidates = _condition_candidates_from_request(
+            user_request, list(obs.get("conditions", {}).keys())
+        )
+        if resolve and resolved_condition is None:
+            match = resolve_condition_from_request(user_request, obs["conditions"])
+            if match is not None:
+                resolved_condition = match
+                tool_confidences["condition"] = 1.0
+
+    # HITL resume: a Supervisor axis (band / channels / condition) was just
+    # answered, validated and persisted by clarification_pause.  Do not ask the
+    # LLM to re-derive it; re-read the (cheap, deterministic) dataset metadata,
+    # keep the persisted axes and let the halt logic below ask ONLY for the next
+    # unresolved axis.
+    resuming = (
+        state.get("clarification_response") is not None
+        and state.get("clarification_resume_kind") in AXIS_KINDS
+    )
+    if resuming:
+        if not (dataset_sfreq and dataset_available_channels):
+            _capture_dataset_info(_direct_tool("get_dataset_info", {"data_path": raw_data_path}))
+        _capture_conditions(_direct_tool("get_dataset_conditions", {"data_path": raw_data_path}))
+        attempted_frequency_band = resolved_band_info is not None
+        attempted_channel_selection = resolved_channel_info is not None
+        loop_exhausted = False
+
     # Sub-part 2: The ReAct Execution Loop
-    for iteration in range(max_iterations):
+    for iteration in range(0 if resuming else max_iterations):
         try:
             response: AIMessage = llm_with_tools.invoke(messages)
         except (ValueError, Exception) as _llm_err:
@@ -557,6 +752,7 @@ def supervisor_node(
 
                 # Capture per-condition trial counts for manifest compilation.
                 if t_name == "get_dataset_conditions" and "conditions" in observation:
+                    conditions_tool_called = True
                     resolved_condition_counts = observation["conditions"]
                     if resolved_trial_count is None and "total_trials" in observation:
                         resolved_trial_count = observation["total_trials"]
@@ -564,12 +760,16 @@ def supervisor_node(
                 if t_name == "get_dataset_info":
                     if "duration_seconds" in observation and observation["duration_seconds"] > 0:
                         state["dataset_duration_seconds"] = observation["duration_seconds"]
+                        dataset_duration_seconds = observation["duration_seconds"]
                     if "sfreq" in observation and observation["sfreq"] > 0:
                         state["dataset_sfreq"] = observation["sfreq"]
+                        dataset_sfreq = observation["sfreq"]
                     if "available_channels" in observation and observation["available_channels"]:
                         state["dataset_available_channels"] = observation["available_channels"]
+                        dataset_available_channels = observation["available_channels"]
                     if "reference" in observation and observation["reference"]:
                         state["dataset_reference"] = observation["reference"]
+                        dataset_reference = observation["reference"]
 
                 tracer.log_event("tool_observation", {"tool": t_name, "observation": observation})
 
@@ -582,11 +782,21 @@ def supervisor_node(
                 # Capture resolution metadata for manifest compilation
                 if t_name == "resolve_frequency_band" and "confidence" in observation:
                     tool_confidences["frequency_band"] = observation["confidence"]
-                    resolved_band_info = observation
+                    if not observation.get("error"):
+                        resolved_band_info = observation
+                        last_band_error = None
+                    else:
+                        last_band_error = str(observation["error"])
                 elif t_name == "resolve_channel_selection" and "confidence" in observation:
                     tool_confidences["channels"] = observation["confidence"]
-                    resolved_channel_info = observation
+                    if not observation.get("error"):
+                        resolved_channel_info = observation
+                    else:
+                        last_unresolved_channels = list(observation.get("unresolved_channels") or [])
                 elif t_name == "get_dataset_conditions" and "conditions" in observation:
+                    condition_candidates = _condition_candidates_from_request(
+                        user_request, list(observation.get("conditions", {}).keys())
+                    )
                     match = resolve_condition_from_request(user_request, observation["conditions"])
                     if match is not None:
                         resolved_condition = match
@@ -610,12 +820,35 @@ def supervisor_node(
     )
 
     if not (band_ok and channels_ok and condition_ok):
-        if not loop_exhausted and not axis_resolution_attempted and informational_tool_outputs:
-            informational_text = (
-                response.content.strip()
-                if (response and isinstance(response.content, str))
-                else ""
-            )
+        # Genuine informational requests are those where the user asked for info/plots,
+        # NOT an analysis request where parameters are missing or the LLM is asking for clarification.
+        informational_text = (
+            response.content.strip()
+            if (response and isinstance(response.content, str))
+            else ""
+        )
+        clarification_indicators = [
+            "clarif", "specify", "missing", "please specify", "lacks", "require",
+            "not specified", "unspecified", "frequency band", "target condition",
+        ]
+        has_clarif_text = any(ci in informational_text.lower() for ci in clarification_indicators)
+        user_req_lc = (user_request or "").lower()
+        is_analysis_query = any(k in user_req_lc for k in [
+            "analy", "compute", "calc", "pipeline", "fc", "functional connectivity",
+            "metric", "pli", "wpli", "coherence"
+        ])
+        has_overview_plot = "generate_dataset_overview_plot" in informational_tool_outputs
+
+        is_pure_informational = (
+            not resuming
+            and not loop_exhausted
+            and not axis_resolution_attempted
+            and informational_tool_outputs
+            and not has_clarif_text
+            and (has_overview_plot or not is_analysis_query)
+        )
+
+        if is_pure_informational:
             if not informational_text or informational_text.startswith("[TOOL_CALLS]"):
                 informational_text = "Request completed."
 
@@ -624,34 +857,82 @@ def supervisor_node(
                 "tools": list(informational_tool_outputs.keys()),
             })
             return {
-                "clarification_question": None,
+                **legacy_fields(None),
+                "condition_candidates": condition_candidates,
+                "clarification_response": None,
+                "resolved_frequency_band_info": resolved_band_info,
+                "resolved_channel_info": resolved_channel_info,
+                "resolved_condition_value": resolved_condition,
                 "plan": None,
                 "parameter_manifest": None,
                 "preflight_confirmed": False,
                 "informational_response": informational_text,
                 "informational_artifacts": informational_tool_outputs,
+                "dataset_sfreq": dataset_sfreq,
+                "dataset_duration_seconds": dataset_duration_seconds,
+                "dataset_available_channels": dataset_available_channels,
+                "dataset_reference": dataset_reference,
             }
 
-        # Genuine halt: an axis was attempted (or partially resolved) and is still missing
+        # Genuine halt: an axis was attempted (or partially resolved) and is still missing.
+        # HITL choices must come from the ACTUAL loaded dataset, never from whatever the
+        # LLM happened to call: fetch any metadata the ReAct loop skipped, deterministically.
+        if not (dataset_sfreq and dataset_available_channels):
+            _capture_dataset_info(_direct_tool("get_dataset_info", {"data_path": raw_data_path}))
+        axes_engaged = bool(
+            attempted_frequency_band or attempted_channel_selection
+            or resolved_band_info or resolved_channel_info
+        )
+        if not condition_ok and not conditions_tool_called and axes_engaged:
+            # Options only: resolution stays with the tool loop / persisted HITL answer.
+            _capture_conditions(
+                _direct_tool("get_dataset_conditions", {"data_path": raw_data_path}),
+                resolve=False,
+            )
+
         last_thought = response.content.strip() if (response and isinstance(response.content, str)) else ""
         if loop_exhausted:
-            clarification_question = "Maximum reasoning iterations reached without resolving all analysis parameters. Please specify frequency band, channels, and condition."
-        elif last_thought and not last_thought.startswith("[TOOL_CALLS]"):
-            clarification_question = last_thought
-        elif not band_ok:
-            band_err = resolved_band_info.get("error") if resolved_band_info else None
+            clarification_kind = "max_iterations"
+            clarification_question = (
+                "Maximum reasoning iterations were reached without resolving all analysis parameters. "
+                "Please specify the missing frequency band, channels, or condition."
+            )
+        elif not band_ok and (attempted_frequency_band or state.get("dataset_sfreq")):
+            clarification_kind = "frequency_band"
+            band_err = last_band_error
             if band_err:
-                clarification_question = f"{band_err} Please specify a valid physiological frequency band (e.g., alpha, 8-12 Hz)."
+                clarification_question = f"{band_err} Please choose a valid physiological frequency band or type a custom numeric range."
             else:
-                clarification_question = "Please specify a valid physiological frequency band (e.g., alpha, 8-12 Hz)."
-        elif not channels_ok:
-            channel_err = resolved_channel_info.get("error") if resolved_channel_info else None
+                clarification_question = "Please choose a physiological frequency band or type a custom numeric range."
+            clarification_options = _valid_frequency_band_options(
+                dataset_sfreq, dataset_duration_seconds
+            )
+        elif not channels_ok and (attempted_channel_selection or state.get("dataset_available_channels")):
+            clarification_kind = "channel_selection"
+            channel_err = (
+                f"Unrecognized channel label(s) not found in dataset: {', '.join(last_unresolved_channels)}."
+                if last_unresolved_channels else None
+            )
             if channel_err:
-                clarification_question = f"{channel_err} Please specify valid channels available in the dataset."
+                clarification_question = f"{channel_err} Choose from the available channels below, or type a channel list/brain region."
             else:
-                clarification_question = "Please specify at least two EEG channels or a valid brain region."
+                clarification_question = "Please choose at least two EEG channels or type a valid brain region."
+            clarification_options = _channel_options(dataset_available_channels)
+        elif not condition_ok and (conditions_tool_called or condition_candidates):
+            clarification_kind = "condition"
+            clarification_question = "Could not resolve a valid experimental condition from the dataset. Choose one below or type the exact condition label."
+            if not condition_candidates:
+                condition_candidates = list(resolved_condition_counts.keys())
+            clarification_options = [
+                {"name": f"condition_{i}", "value": c, "label": c}
+                for i, c in enumerate(condition_candidates)
+            ]
+        elif last_thought and not last_thought.startswith("[TOOL_CALLS]"):
+            clarification_kind = "clarification"
+            clarification_question = last_thought
         else:
-            clarification_question = "Could not resolve a valid experimental condition from your request matching the dataset events. Please specify the target condition."
+            clarification_kind = "clarification"
+            clarification_question = "Please provide the missing analysis parameter(s)."
 
         tracer.log_event("supervisor_halt_unresolved_axes", {
             "question": clarification_question,
@@ -659,13 +940,25 @@ def supervisor_node(
             "channels_ok": channels_ok,
             "condition_ok": condition_ok,
         })
+        clarification = build_clarification(
+            clarification_kind, clarification_question, clarification_options
+        )
         return {
-            "clarification_question": clarification_question,
+            **legacy_fields(clarification),
+            "condition_candidates": condition_candidates,
+            "clarification_response": None,
+            "resolved_frequency_band_info": resolved_band_info,
+            "resolved_channel_info": resolved_channel_info,
+            "resolved_condition_value": resolved_condition,
             "plan": None,
             "parameter_manifest": None,
             "preflight_confirmed": False,
             "informational_response": None,
             "informational_artifacts": None,
+            "dataset_sfreq": dataset_sfreq,
+            "dataset_duration_seconds": dataset_duration_seconds,
+            "dataset_available_channels": dataset_available_channels,
+            "dataset_reference": dataset_reference,
         }
 
     # Resolve trial count for specific matched condition
@@ -676,12 +969,21 @@ def supervisor_node(
     metrics, metric_err = canonicalize_metrics_inline(user_request)
     if metric_err:
         return {
-            "clarification_question": metric_err,
+            **legacy_fields(build_clarification("metric_selection", metric_err)),
+            "condition_candidates": condition_candidates,
+            "clarification_response": None,
+            "resolved_frequency_band_info": resolved_band_info,
+            "resolved_channel_info": resolved_channel_info,
+            "resolved_condition_value": resolved_condition,
             "plan": None,
             "parameter_manifest": None,
             "preflight_confirmed": False,
             "informational_response": None,
             "informational_artifacts": None,
+            "dataset_sfreq": dataset_sfreq,
+            "dataset_duration_seconds": dataset_duration_seconds,
+            "dataset_available_channels": dataset_available_channels,
+            "dataset_reference": dataset_reference,
         }
 
     # Assemble AnalysisPlan
@@ -704,12 +1006,17 @@ def supervisor_node(
     if validation_error:
         tracer.log_event("structural_validation_failed", {"error": validation_error})
         return {
-            "clarification_question": validation_error,
+            **legacy_fields(build_clarification("validation_error", validation_error)),
+            "condition_candidates": condition_candidates,
             "plan": None,
             "parameter_manifest": None,
             "preflight_confirmed": False,
             "informational_response": None,
             "informational_artifacts": None,
+            "dataset_sfreq": dataset_sfreq,
+            "dataset_duration_seconds": dataset_duration_seconds,
+            "dataset_available_channels": dataset_available_channels,
+            "dataset_reference": dataset_reference,
         }
 
     tracer.log_event("manifest_compiled", {"plan": plan.model_dump(), "manifest_rows": len(manifest)})
@@ -724,10 +1031,19 @@ def supervisor_node(
 
     # Return state update — preflight_confirmed remains False until human signs off at Gate 1!
     return {
-        "clarification_question": None,
+        **legacy_fields(None),
+        "condition_candidates": condition_candidates,
+        "clarification_response": None,
+        "resolved_frequency_band_info": resolved_band_info,
+        "resolved_channel_info": resolved_channel_info,
+        "resolved_condition_value": resolved_condition,
         "plan": plan,
         "parameter_manifest": manifest,
         "preflight_confirmed": False,
         "informational_response": None,
         "informational_artifacts": None,
+        "dataset_sfreq": dataset_sfreq,
+        "dataset_duration_seconds": dataset_duration_seconds,
+        "dataset_available_channels": dataset_available_channels,
+        "dataset_reference": dataset_reference,
     }

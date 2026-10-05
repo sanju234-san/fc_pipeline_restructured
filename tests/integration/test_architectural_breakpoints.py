@@ -263,7 +263,7 @@ class TestArchitecturalBreakpoints:
                 if mode == "updates":
                     executed_nodes.extend(payload.keys())
 
-        assert executed_nodes == ["query_transformer", "supervisor", "clarification_pause"]
+        assert executed_nodes == ["query_transformer", "supervisor", "__interrupt__"]
         snapshot = compiled_app.get_state(config)
         assert snapshot.values["plan"] is None
         assert snapshot.values["clarification_question"] is not None
@@ -313,7 +313,7 @@ class TestArchitecturalBreakpoints:
                     executed_nodes.extend(payload.keys())
 
         # Transfer entropy is rejected by canonicalize_metrics_inline
-        assert executed_nodes == ["query_transformer", "supervisor", "clarification_pause"]
+        assert executed_nodes == ["query_transformer", "supervisor", "__interrupt__"]
         snapshot = compiled_app.get_state(config)
         assert snapshot.values["plan"] is None
         assert "transfer entropy" in snapshot.values["clarification_question"].lower()
@@ -374,7 +374,7 @@ class TestArchitecturalBreakpoints:
                 if mode == "updates":
                     executed_nodes.extend(payload.keys())
 
-        assert executed_nodes == ["query_transformer", "supervisor", "clarification_pause"]
+        assert executed_nodes == ["query_transformer", "supervisor", "__interrupt__"]
         snapshot = compiled_app.get_state(config)
         assert snapshot.values["plan"] is None
         assert "gate_1_review" not in executed_nodes

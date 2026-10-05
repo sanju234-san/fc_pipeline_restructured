@@ -7,6 +7,13 @@ from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
 
 from fc_pipeline.schemas.state import GraphState
+from fc_pipeline.schemas.clarification import (
+    AXIS_KINDS,
+    build_clarification,
+    get_clarification,
+    legacy_fields,
+)
+from fc_pipeline.agentic.supervisor.hitl_resolution import apply_clarification_reply
 from fc_pipeline.agentic.supervisor.action_policy import (
     KIND_INPUT_RAIL,
     RAIL_CONTEXT_KINDS,
@@ -159,12 +166,86 @@ def route_informational_output(state: GraphState) -> str:
 
 
 def clarification_pause(state: GraphState) -> Dict[str, Any]:
-    """Placeholder for clarification pause node.
+    """Native HITL pause for Supervisor/query clarification.
 
-    Reached when Query Transformer detects a contradiction or Supervisor
-    halts with an axis clarification question.
+    The interrupt carries the ONE authoritative clarification payload
+    (``axis``/``question``/``options``/``allow_manual``) so the UI can never
+    receive a question without an action list.  On resume the reply is
+    validated against the actual dataset, normalised and persisted into the
+    resolved-axis GraphState fields *here* (not left to the LLM), and the SAME
+    checkpoint continues to the Supervisor, which then skips the resolved axis.
+    An invalid reply keeps the axis unresolved and loops back to this node with
+    an explanatory question (same checkpoint, same options).
     """
-    return {}
+    clarification = get_clarification(state) or build_clarification(
+        "clarification", "Please provide the missing analysis parameter(s)."
+    )
+    decision = interrupt({
+        "type": "clarification",
+        "clarification": clarification,
+        "question": clarification["question"],
+        "kind": clarification["kind"],
+        "options": clarification["options"],
+        "allow_manual": True,
+        "condition_candidates": state.get("condition_candidates") or [],
+        "run_id": state.get("run_id"),
+    })
+    if isinstance(decision, dict):
+        reply = str(decision.get("reply") or decision.get("value") or "").strip()
+    else:
+        reply = str(decision).strip()
+
+    if not reply:
+        # Nothing usable was supplied: re-ask (never fall through to a blank text box).
+        return {**legacy_fields(clarification), "clarification_response": None}
+
+    kind = clarification.get("kind")
+    axis_update: Dict[str, Any] = {}
+    if kind in AXIS_KINDS:
+        axis_update, error = apply_clarification_reply(state, kind, reply)
+        if error:
+            retry = build_clarification(
+                kind,
+                f"{error} Please choose one of the options below or type a valid value.",
+                clarification.get("options"),
+                axis=clarification.get("axis"),
+            )
+            return {**legacy_fields(retry), "clarification_response": None}
+
+    current_request = state.get("user_request", "")
+    updated_request = (
+        f"{current_request}\n[User clarification reply]: {reply}"
+        if current_request else reply
+    )
+    return {
+        **axis_update,
+        "user_request": updated_request,
+        "latest_user_message": reply,
+        "clarification_response": reply,
+        "clarification_resume_kind": kind,
+        **legacy_fields(None),
+        "condition_candidates": [],
+        "informational_response": None,
+        "informational_artifacts": None,
+    }
+
+
+def route_clarification_output(state: GraphState) -> str:
+    """After clarification, return to the appropriate reasoning stage.
+
+    - Invalid/empty reply (question re-issued, no response recorded): loop back
+      to ``clarification_pause`` on the same checkpoint.
+    - Query-transformer contradictions re-condense via the transformer.
+    - Supervisor axis clarifications go straight back to the Supervisor while
+      retaining resolved-axis caches in GraphState.
+    """
+    if state.get("clarification_response") is None:
+        if state.get("clarification_question"):
+            return "clarification_pause"
+        return END
+    if state.get("clarification_resume_kind") == "query_contradiction":
+        return "query_transformer"
+    return "supervisor"
 
 
 def supervisor_error(state: GraphState) -> Dict[str, Any]:
@@ -285,9 +366,18 @@ def build_pipeline_graph() -> StateGraph:
         },
     )
 
-    # Terminal edges
+    # Terminal / clarification edges
     graph.add_edge("data_prep", END)
-    graph.add_edge("clarification_pause", END)
+    graph.add_conditional_edges(
+        "clarification_pause",
+        route_clarification_output,
+        {
+            "supervisor": "supervisor",
+            "query_transformer": "query_transformer",
+            "clarification_pause": "clarification_pause",
+            END: END,
+        },
+    )
     graph.add_edge("supervisor_error", END)
 
     return graph

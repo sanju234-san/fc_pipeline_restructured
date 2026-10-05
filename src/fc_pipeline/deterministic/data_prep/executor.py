@@ -21,6 +21,7 @@ from fc_pipeline.deterministic.data_prep.models import (
 )
 from fc_pipeline.deterministic.data_prep.plotting import generate_diagnostics
 from fc_pipeline.deterministic.data_prep.referencing import apply_reference
+from fc_pipeline.agentic.supervisor.tracer import SupervisorTracer
 from fc_pipeline.deterministic.data_prep.validation import (
     DataPrepValidationError,
     build_safe_output_path,
@@ -33,6 +34,15 @@ logger = logging.getLogger(__name__)
 # Default output directory (relative to project root). Created on demand.
 _DEFAULT_OUTPUT_DIR = Path("outputs")
 _DEFAULT_PLOT_DIR = _DEFAULT_OUTPUT_DIR / "plots"
+
+
+def _trace(run_id: str, event_type: str, payload: dict) -> None:
+    """Emit deterministic Data Prep events through the existing UI/audit tracer."""
+    try:
+        SupervisorTracer(run_id=run_id).log_event(event_type, payload)
+    except Exception:
+        # Explainability must never change scientific execution.
+        pass
 
 
 def run_data_prep(
@@ -69,9 +79,11 @@ def run_data_prep(
         return _run(data_prep_input, out, plots, allowed_data_roots)
     except DataPrepValidationError as exc:
         logger.error("Data Prep validation failed: %s", exc)
+        _trace(data_prep_input.run_id, "data_prep_failed", {"stage": "validation", "error": str(exc)})
         return DataPrepResult(success=False, error=str(exc))
     except Exception as exc:
         logger.exception("Data Prep unexpected error: %s", exc)
+        _trace(data_prep_input.run_id, "data_prep_failed", {"stage": "unexpected", "error": f"{type(exc).__name__}: {exc}"})
         return DataPrepResult(
             success=False,
             error=f"UNEXPECTED_ERROR: {type(exc).__name__}: {exc}",
@@ -87,9 +99,15 @@ def _run(
     """Inner implementation — raises on error (caught by ``run_data_prep``)."""
 
     # ── 1. Validate (calls existing validation.py) ─────────────────────
+    _trace(data_prep_input.run_id, "data_prep_stage", {"stage": "validate", "status": "started"})
     params = validate_data_prep_input(
         data_prep_input, allowed_data_roots=allowed_data_roots
     )
+    _trace(data_prep_input.run_id, "data_prep_stage", {
+        "stage": "validate", "status": "completed",
+        "channels": len(params.channels), "condition": params.condition,
+        "fmin": params.fmin, "fmax": params.fmax, "reference": params.reference_method,
+    })
     logger.info(
         "Validation passed. run_id=%s, channels=%d, condition=%s, "
         "band=%.1f–%.1f Hz, ref=%s",
@@ -102,6 +120,7 @@ def _run(
     )
 
     # ── 2. Load EEG ────────────────────────────────────────────────────
+    _trace(params.run_id, "data_prep_stage", {"stage": "load", "status": "started", "file": params.raw_data_path.name})
     logger.info("Loading EEG data from: %s", params.raw_data_path.name)
     try:
         raw = mne.io.read_raw(str(params.raw_data_path), preload=True, verbose=False)
@@ -113,6 +132,11 @@ def _run(
 
     original_channel_count = len(raw.ch_names)
     sampling_frequency = raw.info["sfreq"]
+    _trace(params.run_id, "data_prep_stage", {
+        "stage": "load", "status": "completed",
+        "channel_count": original_channel_count, "sampling_frequency": sampling_frequency,
+        "duration_seconds": raw.times[-1] if len(raw.times) else 0.0,
+    })
 
     # ── 3. Post-load validation ────────────────────────────────────────
     #    Extract condition labels from annotations for validation.
@@ -129,19 +153,30 @@ def _run(
 
     # ── 4. Clean bad channels ──────────────────────────────────────────
     selected_channel_count = len(params.channels)
+    _trace(params.run_id, "data_prep_stage", {"stage": "bad_channel_screening", "status": "started"})
     raw, dropped_channels = clean_bad_channels(raw, params)
     retained_channel_count = len(raw.ch_names)
+    _trace(params.run_id, "data_prep_stage", {
+        "stage": "bad_channel_screening", "status": "completed",
+        "dropped_channels": dropped_channels, "retained_channel_count": retained_channel_count,
+    })
 
     # ── 5. Apply reference ─────────────────────────────────────────────
+    _trace(params.run_id, "data_prep_stage", {"stage": "reference", "status": "started", "requested_reference": params.reference_method})
     raw, ref_applied = apply_reference(raw, params)
+    _trace(params.run_id, "data_prep_stage", {"stage": "reference", "status": "completed", "reference_applied": ref_applied})
 
     # ── 6. Filter + epoch ──────────────────────────────────────────────
+    _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "started", "fmin": params.fmin, "fmax": params.fmax, "condition": params.condition})
     epochs = filter_and_epoch(raw, params)
     epoch_duration = epochs.tmax - epochs.tmin
+    _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "completed", "epoch_count": len(epochs), "epoch_duration_seconds": epoch_duration})
 
     # ── 7. Diagnostic plots ────────────────────────────────────────────
+    _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "started"})
     plot_dir.mkdir(parents=True, exist_ok=True)
     plot_paths = generate_diagnostics(epochs, params, plot_dir)
+    _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "completed", "plot_count": len(plot_paths), "plot_names": list(plot_paths.keys())})
 
     # ── 8. Save processed epochs ───────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +184,7 @@ def _run(
         output_dir, params.run_id, "preprocessed_epo", ".fif"
     )
     epochs.save(str(output_path), overwrite=True, verbose=False)
+    _trace(params.run_id, "data_prep_stage", {"stage": "save", "status": "completed", "output_file": output_path.name})
     logger.info("Preprocessed epochs saved: %s", output_path.name)
 
     # ── 9. Build result ────────────────────────────────────────────────

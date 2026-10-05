@@ -252,6 +252,11 @@ class TestTransformQuery:
 class TestChainlitSessionSimulation:
     """Test full multi-turn block-then-resolve loop in chainlit_app.py."""
 
+    @pytest.mark.skip(
+        reason="Superseded: the Query Transformer now runs inside the LangGraph "
+        "(query_transformer node -> clarification_pause). Contradiction HITL is covered "
+        "by tests/unit/agentic/test_hitl_clarification.py."
+    )
     @pytest.mark.asyncio
     async def test_block_then_resolve_round_trip(self):
         import chainlit_app
@@ -298,7 +303,7 @@ class TestChainlitSessionSimulation:
         supervisor_invocations = []
         pipeline_call_idx = 0
 
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             nonlocal pipeline_call_idx
             # In the graph architecture, the graph executes the Query Transformer node first
             from fc_pipeline.pipeline.nodes import query_transformer_node_adapter
@@ -671,7 +676,7 @@ class TestChainlitSessionSimulation:
             return _wrapper
 
         supervisor_invocations = []
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             # Graph enters query_transformer node on initial request (revision == 0)
             if not tags or tags.get("revision", 0) == 0:
                 mock_transform(effective_query, effective_query)
@@ -755,7 +760,7 @@ class TestChainlitSessionSimulation:
             return _wrapper
 
         call_idx = 0
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             nonlocal call_idx
             call_idx += 1
             if call_idx == 1:
@@ -868,7 +873,7 @@ class TestGate1PerRowEdits:
             return _wrapper
 
         supervisor_call_count = 0
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             nonlocal supervisor_call_count
             supervisor_call_count += 1
             manifest_captured["ref"] = manifest_initial
@@ -980,7 +985,7 @@ class TestGate1PerRowEdits:
             return _wrapper
 
         supervisor_invocations = []
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             # Graph enters query_transformer node on initial request (revision == 0)
             if not tags or tags.get("revision", 0) == 0:
                 mock_transform(effective_query, effective_query)
@@ -1098,7 +1103,7 @@ class TestGate1PerRowEdits:
             async def _wrapper(*args, **kwargs): return fn(*args, **kwargs)
             return _wrapper
 
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             manifest_captured["ref"] = manifest_initial
             return {"_routed_node": "gate_1_review", "parameter_manifest": manifest_initial}, ["supervisor"]
 
@@ -1185,7 +1190,7 @@ class TestGate1PerRowEdits:
             async def _wrapper(*args, **kwargs): return fn(*args, **kwargs)
             return _wrapper
 
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             return {"_routed_node": "gate_1_review", "parameter_manifest": manifest_initial}, ["supervisor"]
 
         mock_transform = MagicMock(return_value=QueryTransformerResult("eeg_analysis", "compute", "none", "none"))
@@ -1373,7 +1378,7 @@ class TestGate1PerRowEdits:
             return _wrapper
 
         supervisor_invocations = []
-        def mock_run_pipeline(effective_query, run_id, tags=None):
+        def mock_run_pipeline(effective_query, run_id, tags=None, **kwargs):
             supervisor_invocations.append((effective_query, run_id, tags))
             if len(supervisor_invocations) == 1:
                 return {"_routed_node": "gate_1_review", "parameter_manifest": manifest_v1}, ["supervisor"]

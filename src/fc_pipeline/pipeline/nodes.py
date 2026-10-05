@@ -15,6 +15,7 @@ from fc_pipeline.agentic.supervisor.action_policy import (
 from fc_pipeline.agentic.supervisor.agent import supervisor_node
 from fc_pipeline.agentic.supervisor.llm_provider import get_supervisor_llm
 from fc_pipeline.agentic.supervisor.query_transformer import transform_query
+from fc_pipeline.schemas.clarification import build_clarification, legacy_fields
 from fc_pipeline.schemas.state import GraphState
 
 logger = logging.getLogger(__name__)
@@ -147,7 +148,7 @@ def apply_input_rail(state: GraphState, text: str) -> Optional[Dict[str, Any]]:
         }
     return {  # DENY
         **halted,
-        "informational_response": f"🛡️ Request blocked by the input guardrail. {decision.reason}",
+        "informational_response": "🛡️ Guardrail: Cannot process this query.",
         "informational_artifacts": None,
         "decision_context": None,
     }
@@ -158,12 +159,16 @@ def apply_output_rail(state: GraphState) -> Dict[str, Any]:
 
     Screens the LLM-authored `informational_response` against the tool
     observations in `informational_artifacts` (its only grounding). Canned
-    messages (e.g. out-of-scope replies) have no artifacts and are skipped. A
-    future synthesis node should call this same function on its report text.
+    messages (e.g. out-of-scope replies) have no artifacts and are skipped.
     """
     text = state.get("informational_response")
     artifacts = state.get("informational_artifacts")
     if not text or not artifacts:
+        return {}
+
+    # Do not run factual grounding check on clarification or parameter prompt text
+    clarif_words = ["clarif", "specify", "missing", "please specify", "lacks", "require", "not specified"]
+    if any(w in text.lower() for w in clarif_words):
         return {}
 
     decision = _screen_with_rails(
@@ -180,7 +185,7 @@ def apply_output_rail(state: GraphState) -> Dict[str, Any]:
     if decision.behavior == DecisionType.ASK_HUMAN:
         return {"decision_context": decision.decision_context}
     return {  # DENY
-        "informational_response": f"🛡️ Response withheld by the output guardrail. {decision.reason}",
+        "informational_response": "🛡️ Guardrail: Cannot process this query.",
         "decision_context": None,
     }
 
@@ -247,13 +252,20 @@ def query_transformer_node_adapter(state: GraphState) -> Dict[str, Any]:
 
     if qt_result.has_contradiction:
         clarification_text = qt_result.clarification
+        question = (
+            f"## ⚠️ Possible Contradiction Detected\n\n"
+            f"> **Contradiction**: {qt_result.contradiction}\n\n"
+            f"{clarification_text}\n\n"
+            f"---\n_Reply with your clarification, or type `new query: …` to start fresh._"
+        )
+        clarification = build_clarification(
+            "query_contradiction",
+            question,
+            [{"name": "new_query", "value": "new query:", "label": "↻ Start a new query"}],
+        )
         return {
-            "clarification_question": (
-                f"## ⚠️ Possible Contradiction Detected\n\n"
-                f"> **Contradiction**: {qt_result.contradiction}\n\n"
-                f"{clarification_text}\n\n"
-                f"---\n_Reply with your clarification, or type `new query: …` to start fresh._"
-            ),
+            **legacy_fields(clarification),
+            "condition_candidates": [],
             "plan": None,
             "informational_response": None,
             "informational_artifacts": None,
@@ -265,7 +277,7 @@ def query_transformer_node_adapter(state: GraphState) -> Dict[str, Any]:
     # Clean eeg_analysis: pass condensed request to downstream Supervisor
     return {
         "user_request": qt_result.condensed,
-        "clarification_question": None,
+        **legacy_fields(None),
         "informational_response": None,
         "informational_artifacts": None,
         "decision_context": None,
@@ -311,6 +323,7 @@ def data_prep_node_adapter(state: GraphState) -> Dict[str, Any]:
         "channel_plot_paths": result.channel_plot_paths or {},
         "preprocessed_data_path": result.preprocessed_data_path,
         "data_prep_error": result.error,
+        "data_prep_summary": result.summary,
     }
 
     if result.success:

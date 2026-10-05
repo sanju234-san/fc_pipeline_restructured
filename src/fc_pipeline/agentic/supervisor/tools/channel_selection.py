@@ -33,12 +33,24 @@ STOP_WORDS: Set[str] = {
 }
 
 
-def _clean_channel_name(ch: str) -> str:
-    """Stage 1: Cleans channel strings by removing whitespace, prefixes (e.g., EEG), and montage suffixes."""
-    cleaned = ch.strip(" \t\n\r,;[](){}").upper()
+def normalize_channel_label(ch: str) -> str:
+    """Return a canonical electrode label for matching user input to EEG headers.
+
+    EEG/EDF exports commonly decorate the same electrode with transport/montage
+    syntax such as ``EEG C3-REF``, ``C3-REF``, or a trailing period (``C3.``).
+    Those decorations must not make an otherwise exact electrode lookup fail.
+    The original/raw header is still preserved for the value passed to MNE.
+    """
+    cleaned = str(ch).strip(" \t\n\r,;[](){}").upper()
     cleaned = re.sub(r"^EEG\s*", "", cleaned)
-    cleaned = re.sub(r"[-_](REF|LE)$", "", cleaned)
+    cleaned = re.sub(r"[-_]((REF|LE))$", "", cleaned)
+    # Some EDF exports append a period to every electrode name (C3., FC5., ...).
+    cleaned = re.sub(r"\.+$", "", cleaned)
     return cleaned.strip()
+
+
+# Backwards-compatible private name used internally/tests from older revisions.
+_clean_channel_name = normalize_channel_label
 
 
 @tool
