@@ -27,24 +27,21 @@ from fc_pipeline.agentic.supervisor.action_policy import DecisionType, evaluate_
 from fc_pipeline.agentic.supervisor.tracer import SupervisorTracer
 from fc_pipeline.agentic.supervisor.tool_call_parser import extract_mistral_style_tool_calls
 from fc_pipeline.observability.mlflow_tracker import trace_span
-from fc_pipeline.agentic.supervisor.tools.dataset_info import get_dataset_info
-from fc_pipeline.agentic.supervisor.tools.dataset_conditions import get_dataset_conditions
-from fc_pipeline.agentic.supervisor.tools.frequency_band import resolve_frequency_band, CANONICAL_BANDS
-from fc_pipeline.agentic.supervisor.tools.channel_selection import (
-    resolve_channel_selection,
+from fc_pipeline.toolbox.registry import toolbox_registry
+from fc_pipeline.toolbox.dataset import (
+    CANONICAL_BANDS,
     REGION_MAP,
     normalize_channel_label,
 )
-from fc_pipeline.agentic.supervisor.tools.dataset_overview_plot import generate_dataset_overview_plot
 
 
-# Available Supervisor inspection tools (5 total)
+# Available Supervisor inspection tools sourced from centralized toolbox registry (5 total)
 SUPERVISOR_TOOLS = [
-    get_dataset_info,
-    get_dataset_conditions,
-    resolve_frequency_band,
-    resolve_channel_selection,
-    generate_dataset_overview_plot,
+    toolbox_registry.get_tool("get_dataset_info"),
+    toolbox_registry.get_tool("get_dataset_conditions"),
+    toolbox_registry.get_tool("resolve_frequency_band"),
+    toolbox_registry.get_tool("resolve_channel_selection"),
+    toolbox_registry.get_tool("generate_dataset_overview_plot"),
 ]
 TOOL_MAP = {t.name: t for t in SUPERVISOR_TOOLS}
 
@@ -543,8 +540,9 @@ def supervisor_node(
     tracer = SupervisorTracer(run_id=run_id)
     tracer.log_event("supervisor_start", {"user_request": user_request, "raw_data_path": raw_data_path})
 
-    # Sub-part 1: Bind tools to LLM
-    llm_with_tools = llm.bind_tools(SUPERVISOR_TOOLS)
+    # Sub-part 1: Tool isolation — initialize dynamic binding trackers
+    bound_tool_names: set[str] = set()
+    llm_with_tools = llm
 
     messages = [
         SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
@@ -651,8 +649,86 @@ def supervisor_node(
         attempted_channel_selection = resolved_channel_info is not None
         loop_exhausted = False
 
+    # Sub-part 1: Scoping helper driven by registry metadata (deliberate hybrid per Decision C)
+    def _compute_scoped_tools() -> List[Any]:
+        """Compute the set of tools available to the LLM at this point in the ReAct loop.
+
+        Deliberate hybrid per Decision C: uses per-tool exclusion rules, but reads allowed_agents,
+        execution_mode, and pipeline_stage from toolbox_registry metadata, and guarantees
+        never to return anything outside toolbox_registry.get_scoped_llm_tools(agent="supervisor").
+        """
+        all_supervisor_tools = toolbox_registry.get_scoped_llm_tools(agent="supervisor")
+        scoped: List[Any] = []
+
+        # Whole-word regex overview plot intent per Decision D
+        # Note: will need revisiting when Node 3 adds connectivity plotting.
+        has_plot_intent = bool(
+            re.search(
+                r"\b(plot|plots|psd|spectrum|spectrogram|visualize|visualization|overview)\b",
+                user_request or "",
+                re.IGNORECASE,
+            )
+        )
+        plot_completed = "generate_dataset_overview_plot" in informational_tool_outputs
+
+        dataset_loaded = bool(dataset_sfreq and dataset_available_channels)
+        conditions_done = bool(conditions_tool_called or resolved_condition)
+
+        for tool_fn in all_supervisor_tools:
+            t_name = getattr(tool_fn, "name", "")
+            meta = toolbox_registry.get_metadata(t_name)
+
+            if "get_dataset_info" in meta.requires_prerequisites and not dataset_loaded:
+                continue
+
+            if meta.pipeline_stage == "discovery":
+                if t_name == "get_dataset_info":
+                    if not dataset_loaded:
+                        scoped.append(tool_fn)
+                elif t_name == "get_dataset_conditions":
+                    if not conditions_done:
+                        scoped.append(tool_fn)
+
+            elif meta.pipeline_stage == "resolution":
+                if t_name == "resolve_frequency_band":
+                    if not (resolved_band_info and not resolved_band_info.get("error")):
+                        scoped.append(tool_fn)
+                elif t_name == "resolve_channel_selection":
+                    if not (resolved_channel_info and not resolved_channel_info.get("error")):
+                        scoped.append(tool_fn)
+
+            elif meta.pipeline_stage == "diagnostic":
+                if t_name == "generate_dataset_overview_plot":
+                    if has_plot_intent and not plot_completed:
+                        scoped.append(tool_fn)
+
+        return scoped
+
     # Sub-part 2: The ReAct Execution Loop
     for iteration in range(0 if resuming else max_iterations):
+        # Compute scoped tools for this iteration
+        current_scoped_tools = _compute_scoped_tools()
+        current_scoped_names = {getattr(t, "name", "") for t in current_scoped_tools}
+
+        # Decision B: Empty scope check
+        # When all axes are resolved and no requested plot is pending, skip LLM call and break directly
+        if not current_scoped_tools:
+            loop_exhausted = False
+            break
+
+        # Rebind only when the set of tool names changes
+        if current_scoped_names != bound_tool_names:
+            llm_with_tools = llm.bind_tools(current_scoped_tools)
+            bound_tool_names = current_scoped_names
+
+        # Decision A: Strict snapshot guard
+        # Validate tool calls in response against scope snapshot before this LLM invocation
+        iteration_scoped_tool_names = set(bound_tool_names)
+        tracer.log_event("iteration_tool_scope", {
+            "iteration": iteration + 1,
+            "scoped_tools": sorted(list(iteration_scoped_tool_names)),
+        })
+
         try:
             response: AIMessage = llm_with_tools.invoke(messages)
         except (ValueError, Exception) as _llm_err:
@@ -691,6 +767,22 @@ def supervisor_node(
                 t_name = tool_call["name"]
                 t_args = tool_call["args"]
 
+                # Decision A: Strict snapshot scope guard before action policy check
+                if t_name not in iteration_scoped_tool_names:
+                    observation = {
+                        "error": (
+                            f"TOOL_OUT_OF_SCOPE: Tool '{t_name}' is not accessible at this stage. "
+                            f"Available tools: {sorted(list(iteration_scoped_tool_names))}"
+                        )
+                    }
+                    tracer.log_event("tool_scope_violation", {
+                        "tool": t_name,
+                        "scoped_tools": sorted(list(iteration_scoped_tool_names)),
+                    })
+                    call_id = tool_call.get("id", "fallback_id")
+                    messages.append(ToolMessage(tool_call_id=call_id, content=str(observation)))
+                    continue
+
                 # Defensively populate path & run_id for overview plot if omitted by LLM
                 if t_name == "generate_dataset_overview_plot":
                     if not t_args.get("data_path"):
@@ -713,15 +805,18 @@ def supervisor_node(
 
                 tool_fn = TOOL_MAP.get(t_name)
                 # Deterministically pass actual duration and sfreq to resolve_frequency_band (NEVER fabricate duration)
+                actual_duration = dataset_duration_seconds or state.get("dataset_duration_seconds")
+                actual_sfreq = dataset_sfreq or state.get("dataset_sfreq")
+                actual_channels = dataset_available_channels or state.get("dataset_available_channels")
+
                 if t_name == "resolve_frequency_band":
                     if "duration_seconds" not in t_args or t_args.get("duration_seconds") is None:
-                        # Extract actual duration from state if available; do NOT fabricate a fallback
-                        t_args["duration_seconds"] = state.get("dataset_duration_seconds")
-                    if state.get("dataset_sfreq") and ("sfreq" not in t_args or t_args.get("sfreq") != state.get("dataset_sfreq")):
-                        t_args["sfreq"] = state["dataset_sfreq"]
+                        t_args["duration_seconds"] = actual_duration
+                    if actual_sfreq and ("sfreq" not in t_args or t_args.get("sfreq") != actual_sfreq):
+                        t_args["sfreq"] = actual_sfreq
                 elif t_name == "resolve_channel_selection":
-                    if state.get("dataset_available_channels"):
-                        t_args["available_channels"] = state["dataset_available_channels"]
+                    if actual_channels:
+                        t_args["available_channels"] = actual_channels
 
                 # PreToolUse-style policy check (see action_policy.evaluate_action).
                 # All current tools are read-only/reversible -> allow. ask_human is
