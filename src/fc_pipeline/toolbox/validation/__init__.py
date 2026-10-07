@@ -1,12 +1,12 @@
-"""Backward-compatible re-export shim for validation.
+"""Validation toolbox — deterministic, fail-closed EEG pipeline validation.
 
-The canonical implementation has moved to:
-    fc_pipeline.toolbox.validation.data_prep
-
-All existing imports of this module continue to work unchanged.
+Canonical implementations for Data Preparation input validation, recording
+metadata checks, path validation, and safe output path construction.
+Backward-compatible re-export shim:
+    fc_pipeline.deterministic.data_prep.validation
 """
 
-from fc_pipeline.toolbox.validation.data_prep import (  # noqa: F401
+from fc_pipeline.toolbox.validation.data_prep import (
     REQUIRED_MANIFEST_PARAMETERS,
     SUPPORTED_OUTPUT_SUFFIXES,
     SUPPORTED_RAW_SUFFIXES,
