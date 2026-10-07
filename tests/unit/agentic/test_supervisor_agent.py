@@ -423,6 +423,66 @@ class TestSupervisorReActLoop:
         assert result["parameter_manifest"] is None
         assert result["clarification_question"] is not None
 
+    def test_out_of_scope_tool_exhaustion(self, synthetic_eeg_path):
+        """[New] LLM calls an out-of-scope tool on every iteration until max_iterations is reached.
+
+        resolve_frequency_band requires get_dataset_info to have run first (pipeline_stage='resolution',
+        requires_prerequisites=['get_dataset_info']).  The LLM never calls get_dataset_info, so
+        resolve_frequency_band is rejected as TOOL_OUT_OF_SCOPE on every turn.  The loop must:
+        - terminate cleanly without a hang or crash,
+        - return plan=None, parameter_manifest=None, clarification_kind='max_iterations',
+        - produce a clarification object with kind='max_iterations' and axis='unspecified',
+        - trace a 'tool_scope_violation' event for each rejected call.
+        """
+        import os
+        path = str(synthetic_eeg_path)
+        max_iter = 3
+
+        # The LLM stubbornly tries resolve_frequency_band on every turn
+        fake_llm = MockChatModel(responses=[
+            _tool_call("resolve_frequency_band", {"band_name_or_range": "alpha"})
+        ] * max_iter)
+
+        # Verify traced violations on disk (one per iteration)
+        trace_file = os.path.join("logs", "trace_test_oos_exhaustion.json")
+        if os.path.exists(trace_file):
+            try:
+                os.remove(trace_file)
+            except OSError:
+                pass
+
+        state = self._make_state(path, "analyze this EEG")
+        result = supervisor_node(
+            state, llm=fake_llm, run_id="test_oos_exhaustion", max_iterations=max_iter,
+        )
+
+        # loop_exhausted triggers cleanly
+        assert result["plan"] is None
+        assert result["parameter_manifest"] is None
+        assert result["clarification_kind"] == "max_iterations"
+
+        # Clarification object structure
+        clar = result["clarification"]
+        assert clar["kind"] == "max_iterations"
+        assert clar["axis"] == "unspecified"
+
+        assert os.path.exists(trace_file), "trace file must exist"
+        with open(trace_file) as f:
+            trace = json.load(f)
+        violations = [
+            e for e in trace["events"] if e["event_type"] == "tool_scope_violation"
+        ]
+        assert len(violations) == max_iter, (
+            f"Expected {max_iter} TOOL_OUT_OF_SCOPE violations, got {len(violations)}"
+        )
+        for v in violations:
+            assert v["payload"]["tool"] == "resolve_frequency_band"
+        if os.path.exists(trace_file):
+            try:
+                os.remove(trace_file)
+            except OSError:
+                pass
+
     def test_direct_clarification_no_tools(self, synthetic_eeg_path):
         """[Regression] LLM immediately asks for clarification without tool calls."""
         path = str(synthetic_eeg_path)

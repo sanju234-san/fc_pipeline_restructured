@@ -178,16 +178,30 @@ class TestExactBugRegression:
         assert result["resolved_frequency_band_info"]["name"] == "theta"  # band_ok survives the halt
 
     def test_options_come_from_dataset_even_if_llm_skipped_get_dataset_info(self, mmidb_path):
-        """Cause A: options were empty when the LLM never called get_dataset_info."""
+        """Cause A: options were empty when the LLM never called get_dataset_info.
+        Under tool isolation, calling resolvers before get_dataset_info is rejected as out-of-scope.
+        The halt logic deterministically captures dataset info, ensuring channels and sfreq are loaded."""
         llm = MockChatModel(responses=[
             _call("resolve_frequency_band", {"band_name_or_range": "theta", "sfreq": 160.0}),
             _call("resolve_channel_selection", {"requested_channels_or_region": "", "available_channels": []}),
             "Need channels.",
         ])
         result = supervisor_node(_initial_state(mmidb_path, "hitl_skip_info"), llm=llm, run_id="hitl_skip_info")
+        assert result["clarification_question"] is not None
+        assert result["dataset_available_channels"] == EEGMMIDB_LIKE
+        assert result["dataset_sfreq"] == 160.0
+
+    def test_channel_selection_options_populated_on_unresolved_channels(self, mmidb_path):
+        """Verify that when channels are unresolved, the halt produces bounded channel_selection options from the dataset."""
+        result = supervisor_node(
+            _initial_state(mmidb_path, "hitl_channel_options"),
+            llm=_channels_unresolved_llm(mmidb_path),
+            run_id="hitl_channel_options",
+        )
         assert result["clarification"]["kind"] == "channel_selection"
         assert result["clarification"]["options"]
-        assert result["dataset_available_channels"] == EEGMMIDB_LIKE
+        assert len(result["clarification"]["options"]) > 0
+        assert result["clarification"]["axis"] == "channels"
 
     def test_halt_reaches_interrupt_payload_with_options_and_manual(self, mmidb_path):
         g = _Graph(mmidb_path, _channels_unresolved_llm(mmidb_path), "hitl_interrupt")
