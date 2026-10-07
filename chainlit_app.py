@@ -569,9 +569,12 @@ async def _stream_supervisor_events(queue: asyncio.Queue, done_event: asyncio.Ev
         payload = event.get("payload") or {}
         if kind == "tool_call":
             tool = payload.get("tool", "tool")
-            async with cl.Step(name=f"Tool: {tool}", type="tool", show_input=True) as step:
-                step.input = _json_for_ui(payload.get("args", {}))
-                step.output = "Running tool…"
+            try:
+                async with cl.Step(name=f"Tool: {tool}", type="tool", show_input=True) as step:
+                    step.input = _json_for_ui(payload.get("args", {}))
+                    step.output = "Running tool…"
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "tool_observation":
             tool = payload.get("tool", "tool")
             observation = payload.get("observation", {})
@@ -588,27 +591,45 @@ async def _stream_supervisor_events(queue: asyncio.Queue, done_event: asyncio.Ev
                     ui_observation.pop(sensitive_key, None)
                 if plot_path and "plot_path" not in ui_observation:
                     ui_observation["plot"] = "Rendered inline in the chat."
-            async with cl.Step(name=f"Tool result: {tool}", type="tool", elements=elements) as step:
-                step.output = _json_for_ui(ui_observation)
+            try:
+                async with cl.Step(name=f"Tool result: {tool}", type="tool", elements=elements) as step:
+                    step.output = _json_for_ui(ui_observation)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "manifest_compiled":
-            async with cl.Step(name="Supervisor: analysis plan compiled", type="run") as step:
-                step.output = _json_for_ui({
-                    "plan": payload.get("plan"),
-                    "manifest_rows": payload.get("manifest_rows"),
-                })
+            try:
+                async with cl.Step(name="Supervisor: analysis plan compiled", type="run") as step:
+                    step.output = _json_for_ui({
+                        "plan": payload.get("plan"),
+                        "manifest_rows": payload.get("manifest_rows"),
+                    })
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind in {"supervisor_informational_complete", "supervisor_halt_unresolved_axes", "structural_validation_failed"}:
-            async with cl.Step(name=f"Supervisor: {kind.replace('_', ' ')}", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name=f"Supervisor: {kind.replace('_', ' ')}", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "data_prep_stage":
             stage = payload.get("stage", "data preparation")
-            async with cl.Step(name=f"Data Prep: {str(stage).replace('_', ' ').title()}", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name=f"Data Prep: {str(stage).replace('_', ' ').title()}", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "data_prep_failed":
-            async with cl.Step(name="Data Prep: failed", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name="Data Prep: failed", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "supervisor_start":
-            async with cl.Step(name="Supervisor: start", type="run") as step:
-                step.output = "Scientific parameter resolution started."
+            try:
+                async with cl.Step(name="Supervisor: start", type="run") as step:
+                    step.output = "Scientific parameter resolution started."
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         # agent_thought is intentionally not surfaced: the UI gets the factual
         # tool inputs/results and deterministic state transitions, not hidden model reasoning.
     done_event.set()
@@ -1054,8 +1075,9 @@ async def on_message(message: cl.Message):
     is_explicit_new = (
         user_text_lc.startswith("new query:")
         or user_text_lc.startswith("new topic:")
-        or user_text_lc.startswith("reset")
         or user_text_lc == "/reset"
+        or user_text_lc == "reset"
+        or user_text_lc.startswith("reset ")
     )
 
     # A completed run is intentionally read-only for ordinary follow-ups.
@@ -1573,8 +1595,28 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
             ).send()
             return True
 
-    # Anything else stays inside the completed run: never restart the pipeline,
-    # and never require New query just to ask about the existing results.
+    # Conservative heuristic: messages that clearly describe a NEW scientific
+    # analysis intent (new band / channel / condition / metric / "compute" etc.)
+    # fall through to the normal on_message path so the Query Transformer and
+    # Supervisor run a fresh cycle against the same accepted dataset.  Only
+    # checked here (after all follow-up branches above have already consumed
+    # their matches), so "explain the PLI plot" / "show channel C3" cannot
+    # false-positive.
+    NEW_INTENT_KEYWORDS: tuple[str, ...] = (
+        "analy", "compute", "calculate", "pipeline",
+        "fc", "functional connectivity",
+        "metric", "pli", "wpli", "coherence", "plv", "imcoh",
+        "alpha", "beta", "gamma", "theta", "delta", "band",
+        "channel", "condition", "during", "compare",
+        "re-analyse", "reanalyze", "recompute", "repeat",
+    )
+    user_text_lc = user_text.lower()
+    if any(kw in user_text_lc for kw in NEW_INTENT_KEYWORDS):
+        return False
+
+    # Not an explicit follow-up AND not a clear new scientific intent — give
+    # the user the existing hint but with relaxed wording so they know a
+    # typed analysis request will also auto-start a fresh cycle.
     chan_text = await _followup_channel_names_text(state)
     await cl.Message(
         content=(
@@ -1583,7 +1625,7 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
             "`Show me the EEG signal for C3`, `Plot the PSD for C4`, `Compare C3 and C4`, "
             "`Show the dataset before and after Data Prep`, or `Explain the plots generated by the completed analysis`."
             + (f"\n\nChannels in this run: {chan_text}" if chan_text else "")
-            + "\n\nTo analyse something different, press the **🆕 New query** button."
+            + "\n\nOr just type what you want to do next; new analysis requests automatically start a fresh cycle while keeping this dataset loaded. Press **🆕 New query** to force a clean restart."
         )
     ).send()
     return True
@@ -1602,7 +1644,8 @@ async def _offer_new_query_action() -> None:
     await cl.Message(
         content=(
             "**This analysis is complete.** Ask follow-up questions about it any time - "
-            "nothing is re-run. Press **New query** only when you want to start a fresh analysis."
+            "nothing is re-run. One way to restart: press **New query** for a clean cycle; "
+            "typing a new analysis request also works and keeps the current dataset loaded."
         ),
         actions=[
             cl.Action(
@@ -1617,7 +1660,12 @@ async def _offer_new_query_action() -> None:
 
 @cl.action_callback("new_query_button")
 async def _on_new_query_button(action: cl.Action):
-    """Explicit unlock: the ONLY way a completed run is discarded for a fresh analysis."""
+    """Explicit unlock: forces a clean restart of a completed run for a fresh analysis.
+
+    Typed new-analysis requests also auto-start a fresh cycle (keeping the
+    dataset); this button provides an explicit, discoverable alternative that
+    clears `completed_run_state` fully.
+    """
     if not cl.user_session.get("completed_run_active", False):
         # Stale button (a new cycle is already active or nothing has completed).
         try:
@@ -2255,7 +2303,12 @@ async def _handle_pipeline_output(
 
                     await cl.Message(content="\n".join(result_lines)).send()
 
-                    # Display diagnostic plot images inline
+                    # Display diagnostic plot images inline. A rendering/serialization
+                    # error here must not kill the whole pipeline: fall back to a
+                    # short textual hint per-plot so the user still sees "what was
+                    # produced" and can ask follow-ups (e.g. "plot channel variance")
+                    # to re-render. This also guards against Chainlit's internal
+                    # "generator didn't stop after throw()" async generator error.
                     for plot_name, plot_path in dp_plots.items():
                         if Path(plot_path).exists():
                             image = cl.Image(
@@ -2263,10 +2316,26 @@ async def _handle_pipeline_output(
                                 name=plot_name,
                                 display="inline",
                             )
-                            await cl.Message(
-                                content=f"### {plot_name.replace('_', ' ').title()}",
-                                elements=[image],
-                            ).send()
+                            try:
+                                await cl.Message(
+                                    content=f"### {plot_name.replace('_', ' ').title()}",
+                                    elements=[image],
+                                ).send()
+                            except (GeneratorExit, RuntimeError, Exception) as e:
+                                logger.warning(
+                                    "Failed to inline diagnostic image %r: %s",
+                                    plot_name, e,
+                                )
+                                try:
+                                    await cl.Message(
+                                        content=(
+                                            f"### {plot_name.replace('_', ' ').title()}\n\n"
+                                            "⚠️ Rendering the inline image failed. Say "
+                                            f"`Plot the {plot_name.replace('_', ' ')}` and I'll re-generate it."
+                                        )
+                                    ).send()
+                                except (GeneratorExit, RuntimeError, Exception):
+                                    pass
 
                     if dp_error is None and dp_output:
                         # Non-blocking: users may ask post-run inspection questions immediately.

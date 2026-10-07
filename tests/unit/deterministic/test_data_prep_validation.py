@@ -42,6 +42,16 @@ GOOD_RUN_ID = "chainlit_20260921_062638_001"
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def _safe_symlink(link: Path, target: Path, target_is_directory: bool = False) -> None:
+    """Create a symlink, or skip if the OS denies symlink creation privileges (e.g. non-admin Windows)."""
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Creating symlinks on Windows requires Developer Mode or administrator privileges")
+        raise
+
+
 def _plan(
     channels=("F3", "F4"),
     condition="rest",
@@ -572,7 +582,7 @@ class TestRawDataPath:
         target = tmp_path / "secrets.txt"
         target.write_text("x")
         link = tmp_path / "looks_ok.fif"
-        link.symlink_to(target)
+        _safe_symlink(link, target)
         with pytest.raises(DataPrepValidationError) as e:
             validate_raw_data_path(str(link))
         assert _code(e) == "UNSUPPORTED_DATA_FORMAT"
@@ -597,7 +607,7 @@ class TestRawDataPath:
         root = tmp_path / "data_root"
         root.mkdir()
         link = root / "escape.fif"
-        link.symlink_to(synthetic_eeg_path)
+        _safe_symlink(link, synthetic_eeg_path)
         with pytest.raises(DataPrepValidationError) as e:
             validate_raw_data_path(str(link), allowed_data_roots=[root])
         assert _code(e) == "DATA_PATH_OUTSIDE_ALLOWED_ROOTS"
@@ -692,7 +702,7 @@ class TestRunIdAndOutputPaths:
         victim = tmp_path / "victim.txt"
         victim.write_text("keep")
         link = tmp_path / f"channels_before_{GOOD_RUN_ID}.png"
-        link.symlink_to(victim)
+        _safe_symlink(link, victim)
         with pytest.raises(DataPrepValidationError) as e:
             build_safe_output_path(tmp_path, GOOD_RUN_ID, "channels_before", ".png")
         assert _code(e) == "INVALID_OUTPUT_PATH"
@@ -701,7 +711,7 @@ class TestRunIdAndOutputPaths:
         real = tmp_path / "real"
         real.mkdir()
         link = tmp_path / "link"
-        link.symlink_to(real, target_is_directory=True)
+        _safe_symlink(link, real, target_is_directory=True)
         p = build_safe_output_path(link, GOOD_RUN_ID, "channels_after", ".png")
         assert p.parent == real.resolve()
 

@@ -13,8 +13,8 @@ from typing import List, Tuple
 import mne
 import numpy as np
 
-from fc_pipeline.deterministic.data_prep.models import ValidatedDataPrepParams
-from fc_pipeline.deterministic.data_prep.validation import DataPrepValidationError
+from fc_pipeline.schemas.data_prep_models import ValidatedDataPrepParams
+from fc_pipeline.schemas.data_prep_contracts import DataPrepValidationError
 
 logger = logging.getLogger(__name__)
 
