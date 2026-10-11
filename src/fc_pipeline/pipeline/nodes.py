@@ -17,6 +17,7 @@ from fc_pipeline.agentic.supervisor.llm_provider import get_supervisor_llm
 from fc_pipeline.agentic.supervisor.query_transformer import transform_query
 from fc_pipeline.schemas.clarification import build_clarification, legacy_fields
 from fc_pipeline.schemas.state import GraphState
+from fc_pipeline.pipeline.rail_prefilter import is_obviously_in_scope
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ def _check_rail(rail_type: str, messages: List[Dict[str, Any]]) -> Dict[str, Any
 
         rt = RailType.INPUT if rail_type == "input" else RailType.OUTPUT
         result = _get_rails().check(messages, rail_types=[rt])
+        logger.info(
+            "NeMo %s rail result: status=%s rail=%s", rail_type, result.status.value, result.rail
+        )
         return {
             "status": result.status.value,  # passed | modified | blocked
             "content": result.content,
@@ -89,6 +93,11 @@ def _screen_with_rails(
         return None
 
     if rail_type == "input":
+        # Plainly in-scope, marker-free EEG requests skip the LLM classifier,
+        # which small models answer unreliably (see rail_prefilter.py).
+        if is_obviously_in_scope(text):
+            logger.info("NeMo input rail skipped by deterministic pre-filter (in-scope EEG request).")
+            return None
         messages: List[Dict[str, Any]] = [{"role": "user", "content": text}]
     else:
         evidence_text = evidence if isinstance(evidence, str) else json.dumps(evidence, default=str)
@@ -102,7 +111,12 @@ def _screen_with_rails(
             {"role": "assistant", "content": text},
         ]
 
-    result = _check_rail(rail_type, messages)
+    if rail_type == "input":
+        from fc_pipeline.research.dspy_rail import check_input_with_dspy, dspy_rail_enabled
+
+        result = check_input_with_dspy(text) if dspy_rail_enabled() else _check_rail(rail_type, messages)
+    else:
+        result = _check_rail(rail_type, messages)
     return evaluate_action(
         f"nemo_{rail_type}_rail",
         {"text": text},

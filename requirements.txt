@@ -13,3 +13,4 @@ mlflow>=2.9.0
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 nemoguardrails>=0.24.0
+deepagents>=0.7.0

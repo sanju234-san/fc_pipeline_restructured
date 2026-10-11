@@ -30,8 +30,11 @@ def apply_reference(
     Parameters
     ----------
     raw : mne.io.BaseRaw
-        EEG recording after channel selection and bad-channel removal.
-        Modified **in-place**.
+        EEG recording with the FULL recorded montage still present (channel
+        selection happens afterwards, so the average is not computed over the
+        analysis channels alone).  Channels in ``raw.info["bads"]`` (for
+        example flatline channels flagged by ``mark_flatline_channels``) are
+        excluded from the average by MNE.  Modified **in-place**.
     params : ValidatedDataPrepParams
         Must contain ``reference_method`` (only ``"average"`` accepted).
 
@@ -68,8 +71,9 @@ def apply_reference(
     raw.set_eeg_reference("average", projection=False, verbose=False)
 
     logger.info(
-        "Average reference applied. Channels: %d",
-        len(raw.ch_names),
+        "Average reference applied over %d EEG channel(s) (%d excluded as bad).",
+        len(mne.pick_types(raw.info, eeg=True, exclude="bads")),
+        len(raw.info.get("bads", [])),
     )
 
     return raw, "average"

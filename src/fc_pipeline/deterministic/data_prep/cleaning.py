@@ -6,6 +6,9 @@ The canonical implementation has moved to:
 All existing imports of this module continue to work unchanged.
 """
 
-from fc_pipeline.toolbox.preprocessing.cleaning import clean_bad_channels  # noqa: F401
+from fc_pipeline.toolbox.preprocessing.cleaning import (  # noqa: F401
+    clean_bad_channels,
+    mark_flatline_channels,
+)
 
-__all__ = ["clean_bad_channels"]
+__all__ = ["clean_bad_channels", "mark_flatline_channels"]

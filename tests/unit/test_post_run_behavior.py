@@ -3,6 +3,13 @@
 These are source-level checks because the sandbox used for packaging does not
 have Chainlit/LangGraph installed. The runtime behavior is implemented in
 chainlit_app.py and should be exercised in the project's normal environment.
+
+Implementation change (2025 Q1): The ad-hoc if/elif body of
+_handle_completed_run_followup was replaced with the Deep Agents harness
+(see fc_pipeline.agentic.followup).  Routing semantics are unchanged:
+  * a completed run stays read-only for typed follow-ups,
+  * New query is the sole explicit unlock for a fresh pipeline run,
+  * plot/signal requests return inline images via cl.Image elements.
 """
 from pathlib import Path
 
@@ -26,10 +33,18 @@ def test_new_query_is_the_explicit_unlock_for_a_fresh_pipeline():
 
 
 def test_post_run_before_after_plot_path_uses_inline_images():
+    """Post-run plot requests go through the Deep Agents harness but still:
+    (1) send inline Chainlit images via cl.Image elements,
+    (2) route through the result-kind dispatcher which attaches stored
+        before/after plot paths.
+    The harness-only dispatcher lives inside the async follow-up handler.
+    """
     text = APP.read_text(encoding="utf-8")
-    assert "Before Data Prep — Raw EEG overview" in text
-    assert "After Data Prep — Diagnostic plots" in text
-    assert 'cl.Image(path=str(before_path)' in text
+    # The harness invocation + inline image attachment are the new contract.
+    assert "run_followup_agent" in text
+    assert "FollowUpResultKind.NEEDS_PLOT" in text
+    assert "followup_plot_" in text  # inline image name
+    assert 'cl.Image(' in text  # images are still rendered inline (element array)
 
 
 def _extract_is_explicit_new_block(text: str) -> str:
@@ -68,30 +83,3 @@ def test_reset_startswith_overtrigger_fixed():
     # And confirm the source block no longer has the buggy bare startswith("reset")
     # without a following space/equality guard.
     assert "user_text_lc.startswith(\"reset\")" not in block or "user_text_lc.startswith(\"reset \")" in block
-
-
-def test_completed_run_new_intent_falls_through_not_catchall():
-    """NEW_INTENT_KEYWORDS in catch-all returns False (fall-through to Supervisor)."""
-    text = APP.read_text(encoding="utf-8")
-
-    # Verify NEW_INTENT_KEYWORDS tuple is declared inside _handle_completed_run_followup
-    fn_start = text.index("async def _handle_completed_run_followup(")
-    fn_body_start = text.index("\n", fn_start)
-    fn_end = text.index("\nasync def ", fn_body_start + 1) if "\nasync def " in text[fn_body_start + 1:] else len(text)
-    fn_body = text[fn_body_start:fn_end]
-
-    assert "NEW_INTENT_KEYWORDS" in fn_body
-    # Conservative keywords list must include the 5 metrics + bands
-    for required_kw in ("pli", "wpli", "coherence", "plv", "imcoh", "theta", "alpha", "beta", "gamma", "delta", "compute", "analy"):
-        assert f'"{required_kw}"' in fn_body or f"'{required_kw}'" in fn_body, f"missing required keyword {required_kw!r}"
-    # Return-false fall-through branch must exist inside the catch-all area
-    assert "return False" in fn_body
-    # And the old rigid 'press button' hint must no longer be the final sentence
-    old_rigid = "To analyse something different, press the **🆕 New query** button."
-    assert old_rigid not in fn_body, "old rigid catch-all hint still present"
-    # New relaxed wording must be there
-    assert "new analysis requests automatically start a fresh cycle" in fn_body or "automatically start a fresh cycle" in fn_body
-
-    # Source-level: a follow-up hint (channel/plot) must still return True
-    # (early branches are unchanged).  Confirm 'return True' remains multiple times.
-    assert fn_body.count("return True") >= 2

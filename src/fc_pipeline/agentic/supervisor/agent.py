@@ -418,6 +418,74 @@ def compile_and_confirm_manifest(
     return manifest, None
 
 
+# Providers such as Groq validate tool calls server-side: a call to a tool that was
+# not bound for this request is rejected with HTTP 400 ("tool_use_failed") instead
+# of being returned to us. That is the provider-side twin of the TOOL_OUT_OF_SCOPE
+# guard below, so it is recovered the same way (tell the model, let it retry).
+_MAX_TOOL_REJECTIONS = 2
+_TOOL_REJECTION_PATTERN = re.compile(
+    r"tool_use_failed|not in request\.tools|tool call validation failed", re.IGNORECASE
+)
+_REJECTED_TOOL_NAME = re.compile(r"attempted to call tool '([^']+)'")
+
+
+def _is_provider_tool_rejection(err: Exception) -> bool:
+    return bool(_TOOL_REJECTION_PATTERN.search(str(err)))
+
+
+def _rejected_tool_name(err: Exception) -> str:
+    m = _REJECTED_TOOL_NAME.search(str(err))
+    return m.group(1) if m else "unknown"
+
+
+def _tool_rejection_notice(tool_name: str, available: List[str]) -> str:
+    listing = ", ".join(available) if available else "none"
+    return (
+        f"[system notice] Your last tool call to '{tool_name}' was rejected: that tool is not "
+        "available at this step (it is already done, or not unlocked yet). "
+        f"Tools available now: {listing}. Do not call '{tool_name}' again. "
+        "Call one of the available tools, or reply in plain text."
+    )
+
+
+_METRIC_WORD = re.compile(r"metric", re.IGNORECASE)
+
+
+def _strip_metric_prompts(text: str) -> str:
+    """Drop any line of an LLM-written clarification that talks about metrics.
+
+    Metrics are never a question to the user: they default to all five and are
+    shown (and editable) at Gate 1. Only the three scientific axes (condition,
+    frequency band, channels) may be asked for up front.
+    """
+    kept = [ln for ln in str(text or "").splitlines() if not _METRIC_WORD.search(ln)]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def _unresolved_axes_question(band_ok: bool, channels_ok: bool, condition_ok: bool) -> str:
+    """Deterministic clarification text naming only the unresolved axes."""
+    missing = []
+    if not condition_ok:
+        missing.append("**Condition** - which condition label in the recording should be used")
+    if not band_ok:
+        missing.append("**Frequency band** - for example alpha, or a range such as 8-12 Hz")
+    if not channels_ok:
+        missing.append("**Channels** - at least two electrodes, or a brain region")
+    if not missing:
+        return "Please provide the missing analysis parameter(s)."
+    return "Please specify the following for the analysis:\n\n" + "\n".join(
+        f"{i}. {m}" for i, m in enumerate(missing, 1)
+    )
+
+
+def _single_condition_question(label: Any) -> str:
+    return (
+        f"This recording contains only one condition label: **{label}**. "
+        "Please confirm you want to analyze it, or type a different label. "
+        "With a single label, comparing conditions within this file is not possible."
+    )
+
+
 def _condition_candidates_from_request(user_request: str, conditions: List[str]) -> List[str]:
     """Return all dataset conditions mentioned in the active request.
 
@@ -705,6 +773,7 @@ def supervisor_node(
         return scoped
 
     # Sub-part 2: The ReAct Execution Loop
+    tool_rejections = 0
     for iteration in range(0 if resuming else max_iterations):
         # Compute scoped tools for this iteration
         current_scoped_tools = _compute_scoped_tools()
@@ -738,6 +807,26 @@ def supervisor_node(
             # Treat this as a graceful loop exit — the outer halt logic will
             # emit a clarification question instead of crashing the pipeline.
             _err_str = str(_llm_err)
+            if _is_provider_tool_rejection(_llm_err):
+                tool_rejections += 1
+                _rejected = _rejected_tool_name(_llm_err)
+                tracer.log_event("tool_scope_violation", {
+                    "tool": _rejected,
+                    "scoped_tools": sorted(list(iteration_scoped_tool_names)),
+                    "source": "provider_rejection",
+                    "attempt": tool_rejections,
+                })
+                if tool_rejections > _MAX_TOOL_REJECTIONS:
+                    # The model keeps asking for an unavailable tool: leave the loop
+                    # and let the halt logic below ask the user for what is unresolved.
+                    loop_exhausted = True
+                    break
+                messages.append(
+                    HumanMessage(
+                        content=_tool_rejection_notice(_rejected, sorted(list(iteration_scoped_tool_names)))
+                    )
+                )
+                continue
             if "model output" in _err_str or "tool calls" in _err_str or "output text" in _err_str:
                 tracer.log_event("llm_empty_response", {
                     "iteration": iteration + 1,
@@ -1018,13 +1107,17 @@ def supervisor_node(
             clarification_question = "Could not resolve a valid experimental condition from the dataset. Choose one below or type the exact condition label."
             if not condition_candidates:
                 condition_candidates = list(resolved_condition_counts.keys())
+            if len(condition_candidates) == 1:
+                clarification_question = _single_condition_question(condition_candidates[0])
             clarification_options = [
                 {"name": f"condition_{i}", "value": c, "label": c}
                 for i, c in enumerate(condition_candidates)
             ]
         elif last_thought and not last_thought.startswith("[TOOL_CALLS]"):
             clarification_kind = "clarification"
-            clarification_question = last_thought
+            clarification_question = _strip_metric_prompts(last_thought) or _unresolved_axes_question(
+                band_ok, channels_ok, condition_ok
+            )
         else:
             clarification_kind = "clarification"
             clarification_question = "Please provide the missing analysis parameter(s)."

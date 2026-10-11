@@ -1,0 +1,8 @@
+# Optional extras for fc_pipeline.research (not needed for the core pipeline).
+# Install into the project venv, then re-run the full test suite:
+#   pip install -r requirements-research.txt
+# deepagents requires a recent langchain/langgraph; check for resolver conflicts
+# with nemoguardrails and langchain-openai before committing.
+ddgs>=9.0
+deepagents>=0.7
+dspy>=3.0

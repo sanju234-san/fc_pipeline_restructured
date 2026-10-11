@@ -1,6 +1,8 @@
 """Data Preparation executor — single orchestrator for the deterministic pipeline.
 
-Chains: validate → load → clean → reference → filter/epoch → plot → save.
+Chains: validate → load → screen flatline channels (full montage) → reference
+(full montage, flatline channels excluded) → select/drop channels →
+filter/epoch → plot → save.
 All errors are captured into ``DataPrepResult(success=False, error=...)``.
 """
 
@@ -12,14 +14,20 @@ from typing import Optional, Sequence
 
 import mne
 
-from fc_pipeline.deterministic.data_prep.cleaning import clean_bad_channels
+from fc_pipeline.deterministic.data_prep.cleaning import (
+    clean_bad_channels,
+    mark_flatline_channels,
+)
 from fc_pipeline.deterministic.data_prep.epoching import filter_and_epoch
 from fc_pipeline.deterministic.data_prep.models import (
     DataPrepInput,
     DataPrepResult,
     DataPrepSummary,
 )
-from fc_pipeline.deterministic.data_prep.plotting import generate_diagnostics
+from fc_pipeline.deterministic.data_prep.plotting import (
+    generate_diagnostics,
+    plot_channels_before,
+)
 from fc_pipeline.deterministic.data_prep.referencing import apply_reference
 from fc_pipeline.agentic.supervisor.tracer import SupervisorTracer
 from fc_pipeline.deterministic.data_prep.validation import (
@@ -151,31 +159,50 @@ def _run(
         condition_labels=condition_labels,
     )
 
-    # ── 4. Clean bad channels ──────────────────────────────────────────
+    # ── 4. Screen flatline channels on the FULL, UNREFERENCED montage ──
+    #    A dead channel stops being flat once re-referenced, so it must be
+    #    flagged first.  Flagged channels go into raw.info["bads"], which MNE
+    #    excludes from the average reference.  Nothing is dropped yet.
     selected_channel_count = len(params.channels)
     _trace(params.run_id, "data_prep_stage", {"stage": "bad_channel_screening", "status": "started"})
-    raw, dropped_channels = clean_bad_channels(raw, params)
-    retained_channel_count = len(raw.ch_names)
+    pre_flagged = mark_flatline_channels(raw, params)
+    # "Before" view of the selected channels: raw, unfiltered, unreferenced,
+    # with flagged flatline channels highlighted (cheap short snippet only).
+    before_plot = plot_channels_before(raw, params, pre_flagged, plot_dir)
     _trace(params.run_id, "data_prep_stage", {
         "stage": "bad_channel_screening", "status": "completed",
-        "dropped_channels": dropped_channels, "retained_channel_count": retained_channel_count,
+        "flagged_channels": pre_flagged, "montage_channel_count": len(raw.ch_names),
     })
 
-    # ── 5. Apply reference ─────────────────────────────────────────────
+    # ── 5. Apply reference over the full montage ───────────────────────
+    #    The average is taken over all recorded EEG channels (bads excluded),
+    #    NOT over the few channels selected for analysis.
     _trace(params.run_id, "data_prep_stage", {"stage": "reference", "status": "started", "requested_reference": params.reference_method})
     raw, ref_applied = apply_reference(raw, params)
     _trace(params.run_id, "data_prep_stage", {"stage": "reference", "status": "completed", "reference_applied": ref_applied})
 
-    # ── 6. Filter + epoch ──────────────────────────────────────────────
+    # ── 6. Select the analysis channels and drop flagged ones ──────────
+    _trace(params.run_id, "data_prep_stage", {"stage": "channel_selection", "status": "started"})
+    raw, dropped_channels = clean_bad_channels(raw, params, pre_flagged=pre_flagged)
+    retained_channel_count = len(raw.ch_names)
+    _trace(params.run_id, "data_prep_stage", {
+        "stage": "channel_selection", "status": "completed",
+        "dropped_channels": dropped_channels, "retained_channel_count": retained_channel_count,
+    })
+
+    # ── 6b. Filter + epoch ─────────────────────────────────────────────
     _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "started", "fmin": params.fmin, "fmax": params.fmax, "condition": params.condition})
     epochs = filter_and_epoch(raw, params)
-    epoch_duration = epochs.tmax - epochs.tmin
+    # Real epoch length = samples / sfreq (tmax is inclusive in MNE).
+    epoch_duration = len(epochs.times) / epochs.info["sfreq"]
     _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "completed", "epoch_count": len(epochs), "epoch_duration_seconds": epoch_duration})
 
     # ── 7. Diagnostic plots ────────────────────────────────────────────
     _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "started"})
     plot_dir.mkdir(parents=True, exist_ok=True)
     plot_paths = generate_diagnostics(epochs, params, plot_dir)
+    if before_plot:
+        plot_paths = {"channels_before": before_plot, **plot_paths}
     _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "completed", "plot_count": len(plot_paths), "plot_names": list(plot_paths.keys())})
 
     # ── 8. Save processed epochs ───────────────────────────────────────
