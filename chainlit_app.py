@@ -64,9 +64,26 @@ from fc_pipeline.schemas.manifest import ParameterManifestEntry
 from fc_pipeline.schemas.clarification import build_clarification, get_clarification
 from fc_pipeline.agentic.supervisor.agent import _channel_options, _valid_frequency_band_options
 from fc_pipeline.pipeline.graph import build_pipeline_graph, compile_pipeline_app
+from fc_pipeline.pipeline.run_context import (
+    answer_run_question,
+    build_run_context,
+    build_run_context_from_state,
+    load_run_context,
+    display_channel,
+    looks_like_new_analysis,
+    metric_label,
+    restore_state,
+    run_context_path,
+    save_run_context,
+)
 from fc_pipeline.observability import mlflow_tracker
 from fc_pipeline.agentic.supervisor.query_transformer import transform_query
 from fc_pipeline.agentic.supervisor.tracer import supervisor_event_sink
+from fc_pipeline.agentic.followup import (
+    FollowUpResultKind,
+    PostRunContextWindowManager,
+    run_followup_agent,
+)
 
 
 def _strip_local_dir(match) -> str:
@@ -412,6 +429,15 @@ def _download_dataset_url(url: str) -> Path:
 SCIENTIFIC_EDIT_CATEGORIES = {"scientific_axis", "metric_selection"}
 
 
+def _readable_manifest_value(name: str, value: str) -> str:
+    """Display-only: readable channel and metric names in the manifest table."""
+    if name == "channels":
+        return ", ".join(display_channel(p) for p in value.split(","))
+    if name == "metrics":
+        return ", ".join(metric_label(p.strip()) for p in value.split(",") if p.strip())
+    return value
+
+
 def format_manifest_markdown(manifest: Optional[List[ParameterManifestEntry]]) -> str:
     if not manifest:
         return "_No parameter manifest generated._\n"
@@ -425,8 +451,11 @@ def format_manifest_markdown(manifest: Optional[List[ParameterManifestEntry]]) -
         risk_str = (
             f"**{entry.risk_tier.upper()}**" if entry.risk_tier == "elevated" else entry.risk_tier
         )
-        val_str = mask_text(str(entry.proposed_value)).replace("|", "\\|")
-        approved_str = mask_text(entry.human_approved_value) if entry.human_approved_value else "—"
+        val_str = _readable_manifest_value(entry.name, mask_text(str(entry.proposed_value))).replace("|", "\\|")
+        approved_str = (
+            _readable_manifest_value(entry.name, mask_text(entry.human_approved_value))
+            if entry.human_approved_value else "—"
+        )
         lines.append(
             f"| `{entry.name}` | {entry.category} | {val_str} | {conf_str} | {human_str} | {risk_str} | {approved_str} |"
         )
@@ -436,13 +465,13 @@ def format_manifest_markdown(manifest: Optional[List[ParameterManifestEntry]]) -
 def format_plan_markdown(plan: Any) -> str:
     if plan is None:
         return "_No plan generated._\n"
-    metric_names = [str(m) for m in plan.metrics]
+    metric_names = [metric_label(m) for m in plan.metrics]
     lines = [
         "### Analysis Plan",
         "",
         f"- **Frequency Band**: `{plan.freq_band.name}` ({plan.freq_band.fmin}–{plan.freq_band.fmax} Hz)",
         f"- **Condition**: `{plan.condition}`",
-        f"- **Channels**: {', '.join(f'`{c}`' for c in plan.channels)}",
+        f"- **Channels**: {', '.join(f'`{display_channel(c)}`' for c in plan.channels)}",
         f"- **Metrics**: {', '.join(f'`{m}`' for m in metric_names)}",
         "",
     ]
@@ -736,6 +765,7 @@ async def on_chat_start():
         "counter": 0,
         "completed_run_active": False,
         "completed_run_state": None,
+        "last_data_prep_run_id": None,
         "post_run_action_active": False,
     }
     for k, v in session_state.items():
@@ -809,7 +839,7 @@ def _build_graph_state(
     latest_user_message: Optional[str] = None,
 ) -> GraphState:
     data_path = cl.user_session.get("data_path")
-    return {
+    base: Dict[str, Any] = {
         "pipeline_error": None,
         "run_id": run_id,
         "raw_data_path": data_path,
@@ -851,6 +881,23 @@ def _build_graph_state(
         "evaluation_summary_csv_path": None,
         "final_report_path": None,
     }
+    # M5 auto-memory: if this user has CONFIRMED defaults for the 3 scientific
+    # axes (frequency band / channels / condition) or reference, pre-populate
+    # them so the Supervisor skips the corresponding HITL clarification.
+    try:
+        from fc_pipeline.pipeline.user_memory import (
+            apply_confirmed_defaults_to_state,
+            load_preference_store,
+        )
+        store = load_preference_store()
+        defaults_applied = apply_confirmed_defaults_to_state(base, store=store)
+        if defaults_applied:
+            base.update(defaults_applied)
+            cl.user_session.set("m5_defaults_applied", list(defaults_applied.keys()))
+    except Exception as exc:  # pragma: no cover - never block startup on memory failure
+        logger.warning("M5: could not pre-populate defaults (continuing without): %s: %s", type(exc).__name__, exc)
+        cl.user_session.set("m5_defaults_applied", [])
+    return base  # type: ignore[return-value]
 
 
 def _interrupt_node_name(payload: Dict[str, Any], current_state: Optional[Dict[str, Any]] = None) -> str:
@@ -1058,6 +1105,74 @@ async def on_message(message: cl.Message):
         or user_text_lc == "/reset"
     )
 
+    # M5: explicit in-chat memory commands ("/remember ...", "/forget ...",
+    # "remember that I prefer alpha band", etc.).  These NEVER trigger the
+    # Supervisor or HITL graph — they only manipulate the user preference
+    # store.  Return True if the command was handled.
+    async def _try_memory_command(text: str) -> bool:
+        try:
+            from fc_pipeline.pipeline.user_memory import (
+                clear_default,
+                load_preference_store,
+                remember_explicit,
+            )
+        except Exception:
+            return False
+        t_lc = text.lower().lstrip()
+        # /remember ... or /forget ...
+        if t_lc.startswith("/remember") or t_lc.startswith("/memory"):
+            body = re.sub(r"^/\s*(remember|memory)\s*:?\s*", "", text, flags=re.IGNORECASE).strip()
+            if not body:
+                store = load_preference_store()
+                rows = [f"- **{k}:** `{mask_text(str(v))}`" for k, v in store.confirmed_defaults.items()]
+                content = (
+                    "### 🧠 Your remembered defaults\n\n"
+                    + ("\n".join(rows) if rows else "_No defaults saved yet. Answer HITL questions 3+ times and you'll be offered a prompt, or use `/remember alpha band` / `/remember average reference`._")
+                    + "\n\nUse `/forget frequency_band` (or channels / condition / reference) to clear one."
+                )
+                await cl.Message(content=content).send()
+                return True
+            confirmation = remember_explicit(None, body, "chat_command")
+            await cl.Message(
+                content=(
+                    mask_text(confirmation)
+                    if confirmation
+                    else "⚠️ I couldn't figure out what to remember. Try `/remember alpha band` or `/remember average reference`."
+                )
+            ).send()
+            return True
+        if t_lc.startswith("/forget"):
+            body = re.sub(r"^/\s*forget\s*:?\s*", "", text, flags=re.IGNORECASE).strip().lower()
+            mapping = {
+                "band": "frequency_band", "frequency": "frequency_band", "freq": "frequency_band", "frequency_band": "frequency_band",
+                "channels": "channels", "channel": "channels", "ch": "channels",
+                "condition": "condition", "cond": "condition",
+                "reference": "reference", "ref": "reference", "montage": "reference",
+                "report": "report_style", "style": "report_style",
+                "metrics": "metric_set", "metric": "metric_set",
+            }
+            axis = mapping.get(body, body if body in mapping.values() else None)  # type: ignore[arg-type]
+            if axis is None:
+                await cl.Message(
+                    content="❓ `/forget` needs an axis: try `frequency_band` / `channels` / `condition` / `reference`."
+                ).send()
+                return True
+            clear_default(None, axis)
+            await cl.Message(content=f"✅ Cleared your remembered default for **{axis}**.").send()
+            return True
+        # Plain-text "remember that I prefer ..." (not prefixed with /) only if
+        # the regex matches strongly.  Otherwise, fall through to normal routing
+        # so normal chat isn't hijacked.
+        if re.search(r"\bremember\b.*\b(prefer|always|default)\b", t_lc) and any(k in t_lc for k in ("band", "freq", "channel", "condition", "reference", "alpha", "theta", "beta", "gamma", "delta")):
+            confirmation = remember_explicit(None, text, "chat_command")
+            if confirmation:
+                await cl.Message(content=mask_text(confirmation)).send()
+                return True
+        return False
+
+    if await _try_memory_command(user_text):
+        return
+
     # A completed run is intentionally read-only for ordinary follow-ups.
     # Do this before any query transformation/pipeline invocation so a user
     # asking for a plot or summary cannot accidentally restart Supervisor/Data Prep.
@@ -1065,6 +1180,24 @@ async def on_message(message: cl.Message):
         handled = await _handle_completed_run_followup(user_text)
         if handled:
             return
+
+    # Safety net: Data Prep finished earlier in this chat but the completed-run
+    # flag/state is missing (for example after a session reset). Recover the run
+    # from its persisted context instead of silently starting a fresh pipeline
+    # with the follow-up text as a new request.
+    last_run_id = cl.user_session.get("last_data_prep_run_id")
+    if (
+        last_run_id
+        and not is_explicit_new
+        and not (
+            cl.user_session.get("completed_run_active", False)
+            and cl.user_session.get("completed_run_state")
+        )
+    ):
+        if _restore_completed_run(last_run_id):
+            handled = await _handle_completed_run_followup(user_text)
+            if handled:
+                return
 
     # A typed answer to a pending HITL clarification resumes the SAME LangGraph
     # checkpoint (never a fresh run that would forget already-resolved axes).
@@ -1108,6 +1241,7 @@ async def on_message(message: cl.Message):
         cl.user_session.set("gate_1_approved", False)
         cl.user_session.set("completed_run_active", False)
         cl.user_session.set("completed_run_state", None)
+        cl.user_session.set("last_data_prep_run_id", None)
     elif awaiting_clarification:
         accumulated_query = f"{accumulated_query}\n[User clarification reply]: {user_text}"
         cl.user_session.set("accumulated_query", accumulated_query)
@@ -1432,160 +1566,187 @@ async def _followup_explain(state: Dict[str, Any]) -> None:
 
 
 
-async def _handle_completed_run_followup(user_text: str) -> bool:
-    """Handle post-run questions without restarting Supervisor/Data Prep.
+def _restore_completed_run(run_id: str) -> bool:
+    """Re-activate a finished run from its persisted run context.
 
-    Once a pipeline run has completed, ordinary chat messages are treated as
-    post-run inspection requests. They may render artifacts from the completed
-    run (for example, raw-before vs preprocessed-after plots), but they never
-    invoke the Supervisor or Data Prep. A fresh pipeline run requires the
-    explicit ``New query`` action.
+    Returns True when the context was found and the completed-run session state
+    was rebuilt; False when nothing was persisted (for example a failed run), in
+    which case normal routing continues.
+    """
+    candidates = [run_context_path(None, run_id, fallback_dir="outputs")]
+    for path in candidates:
+        if path.exists():
+            ctx = load_run_context(path)
+            if ctx and ctx.get("run_id") == run_id:
+                _activate_completed_run(restore_state(ctx))
+                return True
+    # The context is stored next to the preprocessed epochs, wherever Data Prep wrote them.
+    for found in Path("outputs").rglob(f"run_context_{run_id}.json"):
+        ctx = load_run_context(found)
+        if ctx and ctx.get("run_id") == run_id:
+            _activate_completed_run(restore_state(ctx))
+            return True
+    return False
+
+
+def _activate_completed_run(state: Dict[str, Any]) -> None:
+    cl.user_session.set("completed_run_active", True)
+    cl.user_session.set("completed_run_state", state)
+    try:
+        ctx = build_run_context_from_state(state)
+        manager = PostRunContextWindowManager(ctx)
+        cl.user_session.set("deepagents_followup_manager", manager)
+    except Exception as exc:
+        logger.warning("Deep Agents follow-up manager init failed (continuing without): %s: %s", type(exc).__name__, exc)
+        cl.user_session.set("deepagents_followup_manager", None)
+
+
+async def _handle_completed_run_followup(user_text: str) -> bool:
+    """Handle post-run questions through the Deep Agents harness.
+
+    Architecture (mirrors Deep Agents overview — context management + delegation):
+
+      1. PostRunContextWindowManager compresses chat history, routes intent,
+         and promotes only the run-context SLICE needed for this query into
+         the active prompt.  Everything else lives in the "offload registry"
+         and is only read via tools on demand.
+      2. ``run_followup_agent`` answers in this order: new-analysis dispatch,
+         scripted run-context topics, questions about the recording file
+         (read from its header), plot questions (vision model sees the stored
+         PNGs), then a Deep Agents coordinator with a RunContextQAAgent.
+      3. Before that, named-channel signal / PSD / compare requests are drawn
+         deterministically from the stored data (no LLM).
+
+    A fresh pipeline run still requires the explicit ``New query`` action —
+    nothing here invokes the Supervisor, Data Prep or LangGraph checkpoint.
     """
     text = user_text.strip()
-    low = text.lower()
     state = cl.user_session.get("completed_run_state") or {}
     if not state:
         return False
 
-    wants_plot = any(k in low for k in ("plot", "graph", "visual", "visualize", "figure"))
-    wants_before = any(k in low for k in ("before", "pre-prep", "preprocessing", "raw"))
-    wants_after = any(k in low for k in ("after", "post-prep", "postprocessing", "preprocessed", "data prep"))
-    wants_both = (wants_before and wants_after) or any(
-        k in low for k in ("before and after", "pre and post", "pre/post", "before vs after", "before versus after")
-    )
+    # --- (1) Grab / lazily initialise the Deep Agents context window manager
+    manager: Optional[PostRunContextWindowManager] = cl.user_session.get("deepagents_followup_manager")
+    if manager is None:
+        try:
+            ctx = build_run_context_from_state(state)
+            manager = PostRunContextWindowManager(ctx)
+            cl.user_session.set("deepagents_followup_manager", manager)
+        except Exception as exc:
+            logger.warning("Follow-up manager unavailable: %s: %s", type(exc).__name__, exc)
+            manager = None
 
-    # --- Follow-ups added for the completed-run feature (read-only; no pipeline calls) ---
-    if any(k in low for k in ("connectivity", "coherence", "wpli", "plv")):
-        chan_text = await _followup_channel_names_text(state)
+    # Push the current user turn so sliding-window compression sees it.
+    if manager is not None:
+        manager.push_user(text)
+
+    # --- (1b) Named-channel signal / PSD / compare requests are drawn
+    # deterministically from the stored data, never by the language model.
+    if not looks_like_new_analysis(text):
+        try:
+            if await _followup_channel_request(text, text.lower(), state):
+                if manager is not None:
+                    manager.push_assistant("(Plotted the requested channel(s) from the stored run.)")
+                    manager.set_delegation_used("ChannelPlot")
+                return True
+        except Exception as exc:
+            logger.warning("Channel plot follow-up failed: %s: %s", type(exc).__name__, exc)
+
+    # --- (2) Invoke the harness.  Falls back gracefully if deepagents is
+    # not installed / the LLM is offline (the result object always carries
+    # a usable assistant_text string).
+    with _trace_span("deepagents_followup", span_type="CHAIN", inputs={"query": text[:200]}):
+        try:
+            result = await cl.make_async(run_followup_agent)(text, manager)
+        except Exception as exc:
+            logger.exception("run_followup_agent threw: %s: %s", type(exc).__name__, exc)
+            result = None
+
+    # --- (3) Render the FollowUpResult into Chainlit messages.
+    if result is None:
+        # Last-resort fallback: attempt the deterministic answer, else hand
+        # off to the legacy ad-hoc helpers so the UI never breaks.
+        try:
+            answer = answer_run_question(text, build_run_context_from_state(state))
+        except Exception:
+            answer = None
+        if answer:
+            await cl.Message(content="### 📋 From the completed run\n\n" + answer).send()
+            if manager is not None and answer:
+                manager.push_assistant(answer)
+                manager.set_delegation_used("DeterministicFallback")
+            return True
         await cl.Message(
             content=(
-                "### ℹ️ No connectivity result exists for this run\n\n"
-                "This completed analysis finished at **Data Preparation**; a connectivity stage was not "
-                "executed for it, so there is nothing stored to display. I did not compute anything new.\n\n"
-                "From the completed run I can show the **signal** or **PSD** of any retained channel, "
-                "**compare two channels**, show the **before/after Data Prep** plots, or **explain the plots**."
-                + (f"\n\nRetained channels: {chan_text}" if chan_text else "")
+                "### ℹ️ I can answer questions about this completed analysis\n\n"
+                "Nothing is re-run when you ask.  Try, for example: "
+                "`Show me the EEG signal for C3`, `Plot the PSD for C4`, "
+                "`Compare C3 and C4`, `Show the dataset before and after Data Prep`, "
+                "or `Explain the plots generated by the completed analysis`."
+                "\n\nTo analyse something different, press the **🆕 New query** button."
             )
         ).send()
         return True
 
-    if await _followup_channel_request(text, low, state):
-        return True
-
-    if any(k in low for k in ("explain", "describe", "interpret", "summar", "what did", "what does", "walk me through")) \
-            and any(k in low for k in ("plot", "figure", "graph", "diagnostic", "analysis", "data prep", "preprocess", "result", "run")) \
-            and not wants_both:
-        await _followup_explain(state)
-        return True
-
-    if wants_plot and (wants_both or (wants_before and wants_after)):
-        raw_path = state.get("raw_data_path")
-        preprocessed = state.get("preprocessed_data_path")
-        run_id = state.get("run_id", "completed_run")
-
+    # Render the harness's produced text — wrapped with a contextual header
+    # so the user can see whether this came from RunContextQA / a plot
+    # interpreter / a new-analysis dispatch.
+    if result.kind == FollowUpResultKind.DISPATCH_NEW_QUERY:
+        dispatch_actions = [
+            cl.Action(
+                name="new_query_button",
+                payload={"value": "new_query"},
+                label="🆕 Start new analysis",
+                description="Confirm and discard the frozen completed-run context.",
+            )
+        ]
         await cl.Message(
-            content="### 📊 Post-run comparison\nShowing the completed run's **raw dataset (before Data Prep)** and **preprocessed diagnostics (after Data Prep)**.\n\nNo Supervisor or Data Prep run is triggered by this request."
+            content="### 🆕 That sounds like a different analysis\n\n" + result.assistant_text,
+            actions=dispatch_actions,
         ).send()
-
-        # Before: generate/reuse a raw overview plot. This is an informational
-        # post-run inspection only; it does not alter the completed pipeline.
-        before_path = state.get("before_overview_plot")
-        if not before_path or not Path(str(before_path)).exists():
-            if raw_path and Path(str(raw_path)).exists():
-                try:
-                    result = generate_dataset_overview_plot.invoke({
-                        "data_path": str(raw_path),
-                        "run_id": f"{run_id}_postrun_before",
-                    })
-                    before_path = result.get("plot_path") if isinstance(result, dict) else None
-                    if before_path:
-                        state["before_overview_plot"] = before_path
-                        cl.user_session.set("completed_run_state", state)
-                except Exception as exc:
-                    logger.warning("Post-run before-plot generation failed: %s", exc)
-
-        if before_path and Path(str(before_path)).exists():
-            await cl.Message(
-                content="### Before Data Prep — Raw EEG overview",
-                elements=[cl.Image(path=str(before_path), name="before_data_prep", display="inline")],
-            ).send()
-        else:
-            await cl.Message(content="⚠️ The raw before-Data-Prep overview could not be generated.").send()
-
-        # After: reuse the deterministic diagnostic plots produced by Data Prep.
-        after_plots = state.get("channel_plot_paths") or {}
-        if after_plots:
-            await cl.Message(content="### After Data Prep — Diagnostic plots").send()
-            for plot_name, plot_path in after_plots.items():
-                if plot_path and Path(str(plot_path)).exists():
-                    await cl.Message(
-                        content=f"#### {plot_name.replace('_', ' ').title()}",
-                        elements=[cl.Image(path=str(plot_path), name=f"after_{plot_name}", display="inline")],
-                    ).send()
-        elif preprocessed:
-            await cl.Message(
-                content="ℹ️ The completed run has a preprocessed EEG artifact, but no Data Prep diagnostic image was recorded."
-            ).send()
+        if manager is not None:
+            manager.push_assistant(result.assistant_text)
+            manager.set_delegation_used(result.delegated_to)
         return True
 
-    if wants_plot and (wants_before or wants_after):
-        raw_path = state.get("raw_data_path")
-        run_id = state.get("run_id", "completed_run")
-        if wants_before and raw_path and Path(str(raw_path)).exists():
-            before_path = state.get("before_overview_plot")
-            if not before_path or not Path(str(before_path)).exists():
-                try:
-                    result = generate_dataset_overview_plot.invoke({
-                        "data_path": str(raw_path),
-                        "run_id": f"{run_id}_postrun_before",
-                    })
-                    before_path = result.get("plot_path") if isinstance(result, dict) else None
-                    state["before_overview_plot"] = before_path
-                    cl.user_session.set("completed_run_state", state)
-                except Exception:
-                    before_path = None
-            if before_path and Path(str(before_path)).exists():
-                await cl.Message(
-                    content="### Before Data Prep — Raw EEG overview",
-                    elements=[cl.Image(path=str(before_path), name="before_data_prep", display="inline")],
-                ).send()
-                return True
+    # When the plot interpreter could not run (for example the endpoint cannot
+    # read images), fall back to the deterministic explanation of the stored
+    # plots instead of a bare apology.
+    if (
+        result.kind == FollowUpResultKind.ERROR
+        and manager is not None
+        and manager.route_intent(text) == "plot_interpreter"
+    ):
+        await _followup_explain(state)
+        manager.push_assistant("(Explained the stored diagnostic plots deterministically.)")
+        manager.set_delegation_used("DeterministicFallback")
+        return True
 
-        if wants_after:
-            after_plots = state.get("channel_plot_paths") or {}
-            if after_plots:
-                await cl.Message(content="### After Data Prep — Diagnostic plots").send()
-                for plot_name, plot_path in after_plots.items():
-                    if plot_path and Path(str(plot_path)).exists():
-                        await cl.Message(
-                            content=f"#### {plot_name.replace('_', ' ').title()}",
-                            elements=[cl.Image(path=str(plot_path), name=f"after_{plot_name}", display="inline")],
-                        ).send()
-                return True
+    header_parts = ["### 🧠 From the completed run"]
+    if result.delegated_to:
+        label = result.delegated_to.replace("Agent", " Agent").replace("Q A", " QA")
+        if result.delegated_to == "RecordingFacts":
+            label = "the recording file"
+        header_parts.append(f"_answered by {label}_")
+    header = "\n\n".join(header_parts)
+    message = header + "\n\n" + mask_text(result.assistant_text)
 
-    # PSD without a channel: reuse the stored Data Prep PSD overview.
-    if any(k in low for k in ("psd", "spectr", "power")):
-        psd_plot = (state.get("channel_plot_paths") or {}).get("psd_overview")
-        if psd_plot and Path(str(psd_plot)).exists():
-            await cl.Message(
-                content="### Power Spectral Density — completed run",
-                elements=[cl.Image(path=str(psd_plot), name="after_psd_overview", display="inline")],
-            ).send()
-            return True
+    # Plot-interpreter responses may want to attach inline before/after images.
+    elements: List[Any] = []
+    if result.kind == FollowUpResultKind.NEEDS_PLOT:
+        plots = state.get("channel_plot_paths") or {}
+        for label in result.image_paths or ("before", "after"):
+            raw_path = plots.get(label)
+            if raw_path and Path(str(raw_path)).exists():
+                elements.append(
+                    cl.Image(path=str(raw_path), name=f"followup_plot_{label}", display="inline")
+                )
+    await cl.Message(content=message, elements=elements).send()
 
-    # Anything else stays inside the completed run: never restart the pipeline,
-    # and never require New query just to ask about the existing results.
-    chan_text = await _followup_channel_names_text(state)
-    await cl.Message(
-        content=(
-            "### ℹ️ I can answer questions about this completed analysis\n\n"
-            "Nothing is re-run when you ask. Try, for example: "
-            "`Show me the EEG signal for C3`, `Plot the PSD for C4`, `Compare C3 and C4`, "
-            "`Show the dataset before and after Data Prep`, or `Explain the plots generated by the completed analysis`."
-            + (f"\n\nChannels in this run: {chan_text}" if chan_text else "")
-            + "\n\nTo analyse something different, press the **🆕 New query** button."
-        )
-    ).send()
+    # Record the assistant turn so the next follow-up sees a coherent chat window.
+    if manager is not None:
+        manager.push_assistant(result.assistant_text)
+        manager.set_delegation_used(result.delegated_to)
     return True
 
 
@@ -1618,7 +1779,7 @@ async def _offer_new_query_action() -> None:
 @cl.action_callback("new_query_button")
 async def _on_new_query_button(action: cl.Action):
     """Explicit unlock: the ONLY way a completed run is discarded for a fresh analysis."""
-    if not cl.user_session.get("completed_run_active", False):
+    if not cl.user_session.get("completed_run_active", False) and not cl.user_session.get("last_data_prep_run_id"):
         # Stale button (a new cycle is already active or nothing has completed).
         try:
             await action.remove()
@@ -1630,6 +1791,7 @@ async def _on_new_query_button(action: cl.Action):
     _reset_conversation_state()
     cl.user_session.set("completed_run_active", False)
     cl.user_session.set("completed_run_state", None)
+    cl.user_session.set("last_data_prep_run_id", None)
     cl.user_session.set("post_run_action_active", False)
     try:
         await action.remove()
@@ -1836,11 +1998,76 @@ async def _handle_rail_decision(
     output_state: Dict[str, Any],
     run_id: str,
     msg: cl.Message,
+    accumulated_query: str = "",
 ):
-    """Presents a clean guardrail block message with no scenario ID or internal info."""
-    _reset_conversation_state()
-    msg.content = "🛡️ Guardrail: Cannot process this query."
+    """Human review of a NeMo guardrail pause (input or output rail).
+
+    A rail that blocks, or that could not run, is a *pause*, not a hard stop:
+    the human decides. Nothing is auto-approved - a timeout or a closed
+    session aborts the request. Input-rail approval resumes the graph (which
+    re-enters the Query Transformer with ``input_rail_cleared``); output-rail
+    approval shows the held response.
+    """
+    ctx = output_state.get("decision_context") or {}
+    kind = ctx.get("kind")
+    details = ctx.get("details") or {}
+    is_input = kind == "input_rail"
+    check_failed = details.get("rail_status") == "error"
+
+    title = "Guardrail check unavailable" if check_failed else "Guardrail review"
+    reason = mask_text(str(ctx.get("reason") or "The guardrail paused this request."))
+    flagged = mask_text(str(details.get("flagged_text") or ""))
+    lines = [f"## 🛡️ {title}", "", reason]
+    if is_input and flagged:
+        lines += ["", "**Your message:**", f"> {flagged[:500]}"]
+    if check_failed:
+        lines += ["", "_This is a guardrail infrastructure problem, not a judgement about your request._"]
+    msg.content = "\n".join(lines)
     await msg.update()
+
+    allow_label = "✅ Allow this request" if is_input else "✅ Show the response"
+    actions = [
+        cl.Action(name="approve", payload={"value": "approve"}, label=allow_label,
+                  description="A human explicitly clears this guardrail pause"),
+        cl.Action(name="reject", payload={"value": "reject"}, label="🛑 Block",
+                  description="Keep this blocked"),
+    ]
+    res = await cl.AskActionMessage(
+        content="**Decision required**: allow this to continue, or keep it blocked?",
+        actions=actions,
+        timeout=300,
+    ).send()
+
+    chosen = res.get("name") if isinstance(res, dict) else getattr(res, "name", None)
+    if chosen != "approve":
+        # Reject, timeout, or session drop: never auto-approve.
+        await cl.make_async(_resume_pipeline_sync)(run_id, "reject")
+        _reset_conversation_state()
+        await cl.Message(
+            content="🛡️ Request blocked. Type a new query to continue."
+            if chosen == "reject"
+            else "⚠️ Guardrail review timed out. Request not processed. Type a new query to continue."
+        ).send()
+        return
+
+    final_state, err = await cl.make_async(_resume_pipeline_sync)(run_id, "approve")
+    if err:
+        _reset_conversation_state()
+        await cl.Message(content=f"🛑 Could not resume after guardrail review.\n```\n{mask_text(err)}\n```").send()
+        return
+
+    if not is_input:
+        held = final_state.get("informational_response")
+        await cl.Message(content=mask_text(str(held)) if held else "Guardrail cleared.").send()
+        return
+
+    await _handle_pipeline_output(
+        final_state,
+        final_state.get("_executed_nodes", []),
+        accumulated_query,
+        run_id,
+        msg,
+    )
 
 
 def _manifest_value(manifest: List[ParameterManifestEntry], name: str) -> Optional[str]:
@@ -1911,6 +2138,23 @@ async def _resume_clarification(
     new_accumulated = f"{accumulated_query}\n[User clarification reply]: {reply}"
     cl.user_session.set("accumulated_query", new_accumulated)
 
+    # Read the kind of clarification BEFORE we resume (the checkpointed state
+    # tells us which axis the user just resolved).  The value here is the
+    # pending GraphState from BEFORE the resume; once resumed, new_state will
+    # hold the canonical resolved_{axis}_info.
+    pipeline_app = cl.user_session.get("graph")
+    prev_kind: Optional[str] = None
+    try:
+        if pipeline_app is not None:
+            snap = pipeline_app.get_state({"configurable": {"thread_id": run_id}})
+            if snap and snap.values:
+                prev_kind = (
+                    snap.values.get("clarification_kind")
+                    or snap.values.get("clarification_resume_kind")
+                )
+    except Exception:  # pragma: no cover - defensive only
+        prev_kind = None
+
     resume_msg = cl.Message(content="🔄 Applying your clarification…")
     await resume_msg.send()
     resume_queue: asyncio.Queue = asyncio.Queue()
@@ -1939,6 +2183,92 @@ async def _resume_clarification(
         resume_msg.content = f"❌ Clarification resume failed: {mask_text(new_error)}"
         await resume_msg.update()
         return
+
+    # -------------------- M5: record HITL pick + maybe propose default
+    if not new_error:
+        try:
+            from fc_pipeline.pipeline.user_memory import (
+                PreferenceProposal,
+                confirm_default,
+                record_pick,
+                reject_proposal,
+            )
+
+            axis_map = {
+                "frequency_band": ("frequency_band", new_state.get("resolved_frequency_band_info")),
+                "channel_selection": ("channels", new_state.get("resolved_channel_info")),
+                "condition": ("condition", new_state.get("resolved_condition_value")),
+            }
+            proposal: Optional[PreferenceProposal] = None
+            resolved_value: Any = None
+            chosen_axis: Optional[str] = None
+            mapped = axis_map.get(str(prev_kind or ""))
+            if mapped is not None:
+                chosen_axis, resolved_value = mapped
+                if chosen_axis == "frequency_band" and isinstance(resolved_value, dict):
+                    canonical = resolved_value  # {name, fmin, fmax} dict is the confirm form
+                    proposal = record_pick(None, chosen_axis, resolved_value.get("name") or canonical, run_id)
+                elif chosen_axis == "channels" and isinstance(resolved_value, dict):
+                    chs = resolved_value.get("resolved_channels") or []
+                    resolved_value = chs
+                    proposal = record_pick(None, chosen_axis, chs, run_id)
+                elif chosen_axis == "condition" and isinstance(resolved_value, str):
+                    canonical = resolved_value
+                    proposal = record_pick(None, chosen_axis, canonical, run_id)
+                else:
+                    proposal = None
+
+            if proposal is not None and resolved_value is not None and chosen_axis is not None:
+                answer = await cl.AskActionMessage(
+                    content=(
+                        "### 🧠 Remember this for next time?\n\n"
+                        + proposal.question_text()
+                    ),
+                    actions=[
+                        cl.Action(
+                            name="pref_remember_yes",
+                            payload={"value": "yes"},
+                            label="✅ Yes — remember it",
+                            description="Use this value as your default from now on.",
+                        ),
+                        cl.Action(
+                            name="pref_remember_later",
+                            payload={"value": "later"},
+                            label="⏭️ Ask later",
+                            description="Same counter, just don't ask this session.",
+                        ),
+                        cl.Action(
+                            name="pref_remember_never",
+                            payload={"value": "never"},
+                            label="🚫 Never ask for this",
+                            description="Don't ask me about this exact choice again.",
+                        ),
+                    ],
+                    timeout=300,
+                ).send()
+                if answer is not None:
+                    act = (
+                        answer.get("payload", {}).get("value")
+                        if isinstance(answer, dict)
+                        else getattr(answer, "payload", {}).get("value")
+                    )
+                    if act == "yes" and chosen_axis and resolved_value is not None:
+                        try:
+                            new_defaults = confirm_default(None, chosen_axis, resolved_value)
+                            await cl.Message(
+                                content=(
+                                    f"✅ Remembered **{mask_text(proposal.raw_value_repr)}** "
+                                    f"for **{proposal.axis_label}**. Next run will use it "
+                                    f"automatically (use `/forget {chosen_axis}` to clear)."
+                                )
+                            ).send()
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning("M5 confirm_default failed: %s", exc)
+                    elif act == "never":
+                        reject_proposal(None, proposal.axis, proposal.normalised_value, forever=True)
+        except Exception as exc:  # pragma: no cover - memory path must never break HITL
+            logger.warning("M5 auto-memory proposal path failed: %s: %s", type(exc).__name__, exc)
+
     await _handle_pipeline_output(
         new_state, new_state.get("_executed_nodes", []), new_accumulated, run_id, resume_msg
     )
@@ -2084,8 +2414,9 @@ async def _handle_pipeline_output(
 
         # Generalized gate: a NeMo rail pause carries a decision_context and is
         # presented through the same AskActionMessage/resume mechanics.
-        if (output_state.get("decision_context") or {}).get("kind") in ("input_rail", "output_rail"):
-            await _handle_rail_decision(output_state, run_id, msg)
+        _rail_ctx = output_state.get("decision_context") or {}
+        if _rail_ctx.get("kind") in ("input_rail", "output_rail") and not _rail_ctx.get("resolution"):
+            await _handle_rail_decision(output_state, run_id, msg, accumulated_query)
             return
 
         # --- Gate 1 HITL loop (edit → regenerate artifact → re-render → action) ---
@@ -2187,6 +2518,8 @@ async def _handle_pipeline_output(
                             "MLflow log_manifest failed during Gate 1 Approve (post-edit artifact): %s: %s",
                             type(e).__name__, e,
                         )
+                    # Remember that Data Prep ran for this run, whatever happens next.
+                    cl.user_session.set("last_data_prep_run_id", run_id)
                     # Extract Data Prep results from final state before changing session mode.
                     dp_error = dp_error or final_state.get("data_prep_error")
                     dp_dropped = final_state.get("bad_channels_dropped") or []
@@ -2194,6 +2527,24 @@ async def _handle_pipeline_output(
                     dp_output = final_state.get("preprocessed_data_path")
                     dp_summary = final_state.get("data_prep_summary") or {}
                     dp_manifest = final_state.get("parameter_manifest") or manifest or []
+
+                    # Persist the run context next to the outputs so follow-up questions
+                    # survive a lost chat session. Persistence problems never break the run.
+                    if dp_error is None and dp_output:
+                        try:
+                            _ctx = build_run_context(
+                                run_id=run_id,
+                                plan=plan,
+                                data_prep_summary=dp_summary,
+                                parameter_manifest=dp_manifest,
+                                preprocessed_data_path=dp_output,
+                                raw_data_path=final_state.get("raw_data_path") or cl.user_session.get("data_path"),
+                                channel_plot_paths=dp_plots,
+                                bad_channels_dropped=dp_dropped,
+                            )
+                            save_run_context(_ctx, run_context_path(dp_output, run_id))
+                        except Exception as exc:
+                            logger.warning("Run context not persisted: %s: %s", type(exc).__name__, exc)
 
                     # Preserve the completed run as a read-only artifact context.
                     # Ordinary follow-up messages must not restart Supervisor/Data Prep.

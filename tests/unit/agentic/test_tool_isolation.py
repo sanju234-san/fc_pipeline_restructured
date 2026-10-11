@@ -279,3 +279,73 @@ def test_mistral_out_of_scope_tool_returns_structured_error(synthetic_eeg):
 
     assert result["plan"] is not None
     assert result["parameter_manifest"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Provider-side rejection of an unbound tool (Groq: HTTP 400 "tool_use_failed")
+# ---------------------------------------------------------------------------
+
+GROQ_REJECTION = (
+    "Error code: 400 - {'error': {'message': \"Tool call validation failed: tool call validation "
+    "failed: attempted to call tool 'get_dataset_conditions' which was not in request.tools\", "
+    "'type': 'invalid_request_error', 'code': 'tool_use_failed'}}"
+)
+
+
+class RejectingChatModel(MockChatModel):
+    """Raises the provider's rejection on the listed (0-based) invocations."""
+
+    reject_calls: list = Field(default_factory=list)
+    call_count: int = 0
+    seen: list = Field(default_factory=list)
+    error_text: str = GROQ_REJECTION
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        idx = self.call_count
+        self.call_count += 1
+        self.seen.append([str(getattr(m, "content", "")) for m in messages])
+        if idx in self.reject_calls:
+            raise RuntimeError(self.error_text)
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+def _full_progression(path):
+    return [
+        _tool_call("get_dataset_info", {"data_path": path}),
+        _tool_call("get_dataset_conditions", {"data_path": path}),
+        _tool_call("resolve_frequency_band", {"band_name_or_range": "alpha", "sfreq": 250.0}),
+        _tool_call("resolve_channel_selection", {"requested_channels_or_region": "F3, F4"}),
+    ]
+
+
+def test_provider_tool_rejection_is_recovered_and_the_run_completes(synthetic_eeg):
+    llm = RejectingChatModel(responses=_full_progression(synthetic_eeg), reject_calls=[0])
+    state = _base_state(synthetic_eeg, "compute PLI for alpha on F3, F4 during rest")
+    result = supervisor_node(state, llm=llm, run_id="reject_once_run", max_iterations=8)
+
+    assert result["plan"] is not None
+    assert result["plan"].condition == "rest"
+    # the retry after the rejection carried a notice naming the rejected tool
+    retry_messages = llm.seen[1]
+    notice = [m for m in retry_messages if "[system notice]" in m]
+    assert notice and "get_dataset_conditions" in notice[0]
+    assert "Do not call 'get_dataset_conditions' again" in notice[0]
+
+
+def test_repeated_provider_rejections_end_gracefully_instead_of_crashing(synthetic_eeg):
+    llm = RejectingChatModel(responses=_full_progression(synthetic_eeg), reject_calls=[0, 1, 2, 3, 4, 5])
+    state = _base_state(synthetic_eeg, "compute PLI for alpha on F3, F4 during rest")
+    result = supervisor_node(state, llm=llm, run_id="reject_always_run", max_iterations=8)
+
+    assert result["plan"] is None  # nothing was resolved, nothing was invented
+    assert llm.call_count == 3  # first call + the two allowed retries, then it stops
+    assert result.get("clarification_question") or result.get("clarification")
+
+
+def test_unrelated_llm_errors_are_still_raised(synthetic_eeg):
+    llm = RejectingChatModel(
+        responses=_full_progression(synthetic_eeg), reject_calls=[0], error_text="connection reset by peer"
+    )
+    state = _base_state(synthetic_eeg, "compute PLI for alpha on F3, F4 during rest")
+    with pytest.raises(RuntimeError, match="connection reset"):
+        supervisor_node(state, llm=llm, run_id="other_error_run", max_iterations=8)

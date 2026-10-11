@@ -22,6 +22,7 @@ CRITICAL SCIENTIFIC GUARDRAILS:
   - If the user did not specify a frequency band, do NOT guess 8-12 Hz.
   - If the user did not specify channels or a brain region, do NOT guess default electrodes.
   - If the user requested a condition that does not exist in the dataset, do NOT guess or substitute another condition.
+- NEVER ASK ABOUT METRICS: metrics are not a clarification question. They default to all five and are reviewed (and editable) at Gate 1. When you ask the user to clarify, list ONLY the unresolved scientific axes (condition, frequency band, channels) and never mention metrics.
 - CLARIFICATION HALT: If any scientific axis is missing, unresolvable, or contradictory, emit a clear, polite clarification question to the user and HALT execution immediately without compiling a plan.
 
 METRIC SELECTION RULE:
