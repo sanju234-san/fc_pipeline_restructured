@@ -27,9 +27,20 @@ def filter_and_epoch(
     Steps:
       1. Bandpass filter ``[fmin, fmax]`` Hz using MNE's FIR filter.
       2. Extract events from annotations matching ``params.condition``.
-      3. Compute epoch duration as ``min_cycles / fmin`` (minimum length
-         that provides ``min_cycles`` full cycles of the lowest frequency).
-      4. Create fixed-length epochs from the condition-matched events.
+      3. Compute the epoch length as ``min_cycles / fmin`` rounded UP to a
+         whole number of samples (so every epoch holds at least
+         ``min_cycles`` full cycles of the lowest frequency).
+      4. Build the epochs from the annotated condition segments:
+
+         * a segment with a real duration (more than ~1 sample) is tiled
+           with consecutive, non-overlapping epochs that lie fully inside
+           the segment (``floor(duration / epoch_length)`` epochs);
+         * a segment shorter than one epoch cannot host an epoch and is
+           skipped (and counted in the log);
+         * an instantaneous marker (duration of at most ~1 sample, e.g. a
+           stimulus trigger) keeps the original behaviour: one epoch that
+           starts at the marker.
+
       5. Validate that at least one epoch was produced.
 
     Parameters
@@ -94,38 +105,107 @@ def filter_and_epoch(
             f"No events found for condition '{params.condition}'.",
         )
 
-    # 3. Compute epoch duration from min_cycles constraint
-    #    epoch_duration = min_cycles / fmin
-    #    This ensures at least min_cycles full cycles of the lowest
-    #    frequency fit within each epoch.
+    # 3. Compute the epoch length from the min_cycles constraint
+    #    epoch_duration = min_cycles / fmin, rounded UP to whole samples so the
+    #    final epoch can never contain fewer than min_cycles cycles of fmin.
     epoch_duration = params.min_cycles / params.fmin
-    logger.info(
-        "Epoch duration: %.3f s (min_cycles=%.1f / fmin=%.2f Hz)",
-        epoch_duration,
-        params.min_cycles,
-        params.fmin,
-    )
-
-    # Validate epoch duration against sampling rate
     sfreq = raw.info["sfreq"]
-    min_samples = int(np.ceil(epoch_duration * sfreq))
-    if min_samples < 2:
+    window_samples = int(np.ceil(epoch_duration * sfreq - 1e-9))
+    if window_samples < 2:
         raise DataPrepValidationError(
             "INVALID_EPOCH_DURATION",
             f"Computed epoch duration ({epoch_duration:.4f} s) is too short "
             f"at {sfreq} Hz sampling rate.",
         )
+    window_seconds = window_samples / sfreq
+    logger.info(
+        "Epoch length: %.3f s = %d samples (min_cycles=%.1f / fmin=%.2f Hz).",
+        window_seconds,
+        window_samples,
+        params.min_cycles,
+        params.fmin,
+    )
 
-    # 4. Create epochs
-    #    tmin=0, tmax=epoch_duration (epoch starts at event onset)
+    # 4. Build epoch start positions from the annotated condition segments.
+    #    Annotations are kept sorted by onset by MNE, and
+    #    ``events_from_annotations`` emits events in the same order, so the
+    #    k-th condition event corresponds to the k-th condition annotation.
+    annotations = raw.annotations
+    segment_durations = np.asarray(annotations.duration)[
+        np.asarray(annotations.description) == params.condition
+    ]
+    if len(segment_durations) != len(condition_events):
+        # Defensive fallback: durations cannot be aligned with events, so
+        # keep the original onset-only behaviour instead of guessing.
+        logger.warning(
+            "Condition '%s': %d event(s) but %d annotation duration(s); "
+            "falling back to one epoch per event onset.",
+            params.condition,
+            len(condition_events),
+            len(segment_durations),
+        )
+        segment_durations = np.zeros(len(condition_events))
+
+    marker_max_seconds = 1.5 / sfreq  # treated as an instantaneous marker
+    starts: list[int] = []
+    n_markers = 0
+    n_segments_used = 0
+    segments_too_short: list[float] = []
+
+    for onset_sample, duration in zip(condition_events[:, 0], segment_durations):
+        if duration <= marker_max_seconds:
+            starts.append(int(onset_sample))
+            n_markers += 1
+            continue
+        segment_samples = int(np.floor(duration * sfreq + 1e-9))
+        n_windows = segment_samples // window_samples
+        if n_windows == 0:
+            segments_too_short.append(float(duration))
+            continue
+        n_segments_used += 1
+        starts.extend(int(onset_sample) + window_samples * k for k in range(n_windows))
+
+    if segments_too_short:
+        logger.warning(
+            "Skipped %d '%s' segment(s) shorter than one epoch (%.3f s): "
+            "longest skipped = %.3f s.",
+            len(segments_too_short),
+            params.condition,
+            window_seconds,
+            max(segments_too_short),
+        )
+
+    if not starts:
+        raise DataPrepValidationError(
+            "INSUFFICIENT_EPOCH_LENGTH",
+            f"No '{params.condition}' segment is long enough for one epoch "
+            f"of {window_seconds:.3f} s ({params.min_cycles:g} cycles of "
+            f"{params.fmin:g} Hz). Longest segment: "
+            f"{max(segments_too_short):.3f} s.",
+        )
+
+    epoch_events = np.column_stack(
+        [
+            np.asarray(starts, dtype=int),
+            np.zeros(len(starts), dtype=int),
+            np.full(len(starts), event_id[params.condition], dtype=int),
+        ]
+    )
+    epoch_events = epoch_events[np.argsort(epoch_events[:, 0], kind="stable")]
+    target_event_id = {params.condition: event_id[params.condition]}
+
+    # 5. Create epochs
+    #    tmin=0; tmax is inclusive in MNE, so (window_samples - 1) / sfreq
+    #    gives exactly ``window_samples`` samples per epoch and keeps tiled
+    #    epochs contiguous without a one-sample overlap.
     #    baseline=None: no baseline correction (band-pass filter already applied)
     try:
         epochs = mne.Epochs(
             raw,
-            events=condition_events,
+            events=epoch_events,
             event_id=target_event_id,
             tmin=0.0,
-            tmax=epoch_duration,
+            tmax=(window_samples - 1) / sfreq,
             baseline=None,
             preload=True,
             verbose=False,
@@ -136,24 +216,38 @@ def filter_and_epoch(
             f"MNE Epochs creation failed: {type(exc).__name__}: {exc}",
         )
 
-    # Drop bad epochs if any were auto-rejected
+    # Drop bad epochs if any were auto-rejected (e.g. overlapping BAD annotations)
     epochs.drop_bad(verbose=False)
 
-    # 5. Validate epoch count
+    # 6. Validate epoch count
     n_epochs = len(epochs)
     if n_epochs == 0:
         raise DataPrepValidationError(
             "NO_VALID_EPOCHS",
             "No valid epochs remain after segmentation. The epoch duration "
-            f"({epoch_duration:.3f} s) may exceed the available annotation "
+            f"({window_seconds:.3f} s) may exceed the available annotation "
             f"segments for condition '{params.condition}'.",
         )
 
+    if n_epochs < 2:
+        logger.warning(
+            "Only %d epoch(s) for condition '%s'. Phase- and coherence-based "
+            "connectivity is estimated across epochs and is not reliable with "
+            "so few; downstream connectivity checks should treat this as "
+            "insufficient data.",
+            n_epochs,
+            params.condition,
+        )
+
     logger.info(
-        "Created %d epoch(s) of %.3f s for condition '%s'.",
+        "Created %d epoch(s) of %.3f s for condition '%s' "
+        "(%d tiled segment(s), %d marker(s), %d segment(s) too short).",
         n_epochs,
-        epoch_duration,
+        window_seconds,
         params.condition,
+        n_segments_used,
+        n_markers,
+        len(segments_too_short),
     )
 
     return epochs

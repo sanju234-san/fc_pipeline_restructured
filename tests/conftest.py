@@ -1,8 +1,16 @@
 """Pytest fixtures: synthetic MNE Raw/Epochs datasets and sample GraphState."""
 
+import sys
+from pathlib import Path
+
 import pytest
 import numpy as np
 import mne
+
+
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 
 @pytest.fixture(scope="session")
