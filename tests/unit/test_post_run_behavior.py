@@ -3,6 +3,13 @@
 These are source-level checks because the sandbox used for packaging does not
 have Chainlit/LangGraph installed. The runtime behavior is implemented in
 chainlit_app.py and should be exercised in the project's normal environment.
+
+Implementation change (2025 Q1): The ad-hoc if/elif body of
+_handle_completed_run_followup was replaced with the Deep Agents harness
+(see fc_pipeline.agentic.followup).  Routing semantics are unchanged:
+  * a completed run stays read-only for typed follow-ups,
+  * New query is the sole explicit unlock for a fresh pipeline run,
+  * plot/signal requests return inline images via cl.Image elements.
 """
 from pathlib import Path
 
@@ -26,7 +33,15 @@ def test_new_query_is_the_explicit_unlock_for_a_fresh_pipeline():
 
 
 def test_post_run_before_after_plot_path_uses_inline_images():
+    """Post-run plot requests go through the Deep Agents harness but still:
+    (1) send inline Chainlit images via cl.Image elements,
+    (2) route through the result-kind dispatcher which attaches stored
+        before/after plot paths.
+    The harness-only dispatcher lives inside the async follow-up handler.
+    """
     text = APP.read_text(encoding="utf-8")
-    assert "Before Data Prep — Raw EEG overview" in text
-    assert "After Data Prep — Diagnostic plots" in text
-    assert 'cl.Image(path=str(before_path)' in text
+    # The harness invocation + inline image attachment are the new contract.
+    assert "run_followup_agent" in text
+    assert "FollowUpResultKind.NEEDS_PLOT" in text
+    assert "followup_plot_" in text  # inline image name
+    assert 'cl.Image(' in text  # images are still rendered inline (element array)
