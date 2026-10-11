@@ -51,10 +51,25 @@ from typing import (
     Sequence,
     Tuple,
     Union,
-    get_args,
 )
 
-from fc_pipeline.deterministic.data_prep.models import (
+# ---------------------------------------------------------------------------
+# Leaf contracts (imported first, before any deterministic.* imports, to break
+# the circular import between toolbox.validation ↔ deterministic.data_prep.*).
+# These names continue to be re-exported from this module so existing
+#   from fc_pipeline.toolbox.validation.data_prep import REQUIRED_MANIFEST_PARAMETERS
+# consumers keep working with no code changes.
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.data_prep_contracts import (
+    DataPrepValidationError,
+    REFERENCE_ALIASES,
+    RECOGNISED_UNSUPPORTED_REFERENCES,
+    REQUIRED_MANIFEST_PARAMETERS,
+    SUPPORTED_OUTPUT_SUFFIXES,
+    SUPPORTED_RAW_SUFFIXES,
+    SUPPORTED_REFERENCE_METHODS,
+)
+from fc_pipeline.schemas.data_prep_models import (
     DataPrepInput,
     ReferenceMethod,
     ValidatedDataPrepParams,
@@ -66,47 +81,19 @@ PathLike = Union[str, Path]
 
 
 # --------------------------------------------------------------------------- #
-# Allowlists / constants
+# Private allowlists / helpers (remain here; not part of the leaf contract)
 # --------------------------------------------------------------------------- #
 
-# Raw formats MNE can read without executing pickled/arbitrary code. Compared
-# case-insensitively against the *resolved* target file name.
-SUPPORTED_RAW_SUFFIXES: Tuple[str, ...] = (
-    ".fif.gz",
-    ".fif",
-    ".edf",
-    ".bdf",
-    ".set",
-    ".vhdr",
-)
-
-# Single source of truth is the ReferenceMethod Literal in models.py.
-SUPPORTED_REFERENCE_METHODS = frozenset(get_args(ReferenceMethod))
-_REFERENCE_ALIASES: Mapping[str, str] = {
-    "average": "average",
-    "car": "average",
-    "common average": "average",
-    "common average reference": "average",
-}
-# Recognised methods that cannot be executed because the plan/manifest carry no
-# electrode specification for them. Reported distinctly from "unknown".
-_RECOGNISED_UNSUPPORTED_REFERENCES = frozenset({"mastoid", "bipolar"})
-
-# The manifest rows Data Prep consumes (see module docstring).
-REQUIRED_MANIFEST_PARAMETERS: Tuple[str, ...] = (
-    "freq_band",
-    "channels",
-    "condition",
-    "reference",
-    "bad_channel_variance_threshold",
-    "min_cycles",
-)
+# The canonical reference alias map now lives in schemas.data_prep_contracts as
+# ``REFERENCE_ALIASES``. Keep a local private alias with the original name so
+# this file's private functions don't need to be edited (zero-logic migration).
+_REFERENCE_ALIASES: Mapping[str, str] = REFERENCE_ALIASES
+_RECOGNISED_UNSUPPORTED_REFERENCES = RECOGNISED_UNSUPPORTED_REFERENCES
 
 # run_id becomes part of output filenames: no separators, dots or whitespace.
 # Rejected, never rewritten (rewriting could make two runs collide).
 _RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _OUTPUT_STEM_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,39}")
-SUPPORTED_OUTPUT_SUFFIXES: Tuple[str, ...] = (".png", ".fif")
 
 _MAX_PATH_CHARS = 4096
 _MAX_REPORTED_LABELS = 10
@@ -129,20 +116,9 @@ _UNREFERENCED_PROPOSAL_RE = re.compile(r"unreferenced \(proposed: ([a-z ]+)\)")
 
 
 # --------------------------------------------------------------------------- #
-# Error type
+# Local helpers (error factory moved AFTER imports above so DataPrepValidationError
+# is already populated from the leaf contract).
 # --------------------------------------------------------------------------- #
-
-class DataPrepValidationError(Exception):
-    """A deterministic validation failure with a stable machine-readable code.
-
-    ``str(exc)`` is ``"CODE: message"``, matching the ``data_prep_error`` style
-    used elsewhere in the design (e.g. ``INSUFFICIENT_CHANNELS: ...``).
-    """
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        self.message = message
-        super().__init__(f"{code}: {message}")
 
 
 def _fail(code: str, message: str) -> DataPrepValidationError:

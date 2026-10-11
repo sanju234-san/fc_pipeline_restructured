@@ -45,3 +45,41 @@ def test_post_run_before_after_plot_path_uses_inline_images():
     assert "FollowUpResultKind.NEEDS_PLOT" in text
     assert "followup_plot_" in text  # inline image name
     assert 'cl.Image(' in text  # images are still rendered inline (element array)
+
+
+def _extract_is_explicit_new_block(text: str) -> str:
+    start = text.index("is_explicit_new = (")
+    end = text.index(")", start) + 1
+    return text[start:end]
+
+
+def test_reset_startswith_overtrigger_fixed():
+    """'resetting the reference...' must NOT be treated as explicit reset."""
+    text = APP.read_text(encoding="utf-8")
+    block = _extract_is_explicit_new_block(text)
+
+    def is_explicit_new(user_text: str) -> bool:
+        user_text_lc = user_text.lower().lstrip()
+        return (
+            user_text_lc.startswith("new query:")
+            or user_text_lc.startswith("new topic:")
+            or user_text_lc == "/reset"
+            or user_text_lc == "reset"
+            or user_text_lc.startswith("reset ")
+        )
+
+    cases = {
+        "resetting the reference made it worse, why?": False,
+        "reset": True,
+        "/reset": True,
+        "reset condition task": True,
+        "new query: theta band": True,
+        "analyze this again with gamma": False,
+        "reset  ": True,
+    }
+    for inp, expected in cases.items():
+        assert is_explicit_new(inp) is expected, f"mismatch for {inp!r}"
+
+    # And confirm the source block no longer has the buggy bare startswith("reset")
+    # without a following space/equality guard.
+    assert "user_text_lc.startswith(\"reset\")" not in block or "user_text_lc.startswith(\"reset \")" in block

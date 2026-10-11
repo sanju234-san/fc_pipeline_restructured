@@ -598,9 +598,12 @@ async def _stream_supervisor_events(queue: asyncio.Queue, done_event: asyncio.Ev
         payload = event.get("payload") or {}
         if kind == "tool_call":
             tool = payload.get("tool", "tool")
-            async with cl.Step(name=f"Tool: {tool}", type="tool", show_input=True) as step:
-                step.input = _json_for_ui(payload.get("args", {}))
-                step.output = "Running tool…"
+            try:
+                async with cl.Step(name=f"Tool: {tool}", type="tool", show_input=True) as step:
+                    step.input = _json_for_ui(payload.get("args", {}))
+                    step.output = "Running tool…"
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "tool_observation":
             tool = payload.get("tool", "tool")
             observation = payload.get("observation", {})
@@ -617,27 +620,45 @@ async def _stream_supervisor_events(queue: asyncio.Queue, done_event: asyncio.Ev
                     ui_observation.pop(sensitive_key, None)
                 if plot_path and "plot_path" not in ui_observation:
                     ui_observation["plot"] = "Rendered inline in the chat."
-            async with cl.Step(name=f"Tool result: {tool}", type="tool", elements=elements) as step:
-                step.output = _json_for_ui(ui_observation)
+            try:
+                async with cl.Step(name=f"Tool result: {tool}", type="tool", elements=elements) as step:
+                    step.output = _json_for_ui(ui_observation)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "manifest_compiled":
-            async with cl.Step(name="Supervisor: analysis plan compiled", type="run") as step:
-                step.output = _json_for_ui({
-                    "plan": payload.get("plan"),
-                    "manifest_rows": payload.get("manifest_rows"),
-                })
+            try:
+                async with cl.Step(name="Supervisor: analysis plan compiled", type="run") as step:
+                    step.output = _json_for_ui({
+                        "plan": payload.get("plan"),
+                        "manifest_rows": payload.get("manifest_rows"),
+                    })
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind in {"supervisor_informational_complete", "supervisor_halt_unresolved_axes", "structural_validation_failed"}:
-            async with cl.Step(name=f"Supervisor: {kind.replace('_', ' ')}", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name=f"Supervisor: {kind.replace('_', ' ')}", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "data_prep_stage":
             stage = payload.get("stage", "data preparation")
-            async with cl.Step(name=f"Data Prep: {str(stage).replace('_', ' ').title()}", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name=f"Data Prep: {str(stage).replace('_', ' ').title()}", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "data_prep_failed":
-            async with cl.Step(name="Data Prep: failed", type="run") as step:
-                step.output = _json_for_ui(payload)
+            try:
+                async with cl.Step(name="Data Prep: failed", type="run") as step:
+                    step.output = _json_for_ui(payload)
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         elif kind == "supervisor_start":
-            async with cl.Step(name="Supervisor: start", type="run") as step:
-                step.output = "Scientific parameter resolution started."
+            try:
+                async with cl.Step(name="Supervisor: start", type="run") as step:
+                    step.output = "Scientific parameter resolution started."
+            except (GeneratorExit, RuntimeError, Exception):
+                pass
         # agent_thought is intentionally not surfaced: the UI gets the factual
         # tool inputs/results and deterministic state transitions, not hidden model reasoning.
     done_event.set()
@@ -1101,8 +1122,9 @@ async def on_message(message: cl.Message):
     is_explicit_new = (
         user_text_lc.startswith("new query:")
         or user_text_lc.startswith("new topic:")
-        or user_text_lc.startswith("reset")
         or user_text_lc == "/reset"
+        or user_text_lc == "reset"
+        or user_text_lc.startswith("reset ")
     )
 
     # M5: explicit in-chat memory commands ("/remember ...", "/forget ...",
@@ -1763,7 +1785,8 @@ async def _offer_new_query_action() -> None:
     await cl.Message(
         content=(
             "**This analysis is complete.** Ask follow-up questions about it any time - "
-            "nothing is re-run. Press **New query** only when you want to start a fresh analysis."
+            "nothing is re-run. One way to restart: press **New query** for a clean cycle; "
+            "typing a new analysis request also works and keeps the current dataset loaded."
         ),
         actions=[
             cl.Action(
@@ -2606,7 +2629,12 @@ async def _handle_pipeline_output(
 
                     await cl.Message(content="\n".join(result_lines)).send()
 
-                    # Display diagnostic plot images inline
+                    # Display diagnostic plot images inline. A rendering/serialization
+                    # error here must not kill the whole pipeline: fall back to a
+                    # short textual hint per-plot so the user still sees "what was
+                    # produced" and can ask follow-ups (e.g. "plot channel variance")
+                    # to re-render. This also guards against Chainlit's internal
+                    # "generator didn't stop after throw()" async generator error.
                     for plot_name, plot_path in dp_plots.items():
                         if Path(plot_path).exists():
                             image = cl.Image(
@@ -2614,10 +2642,26 @@ async def _handle_pipeline_output(
                                 name=plot_name,
                                 display="inline",
                             )
-                            await cl.Message(
-                                content=f"### {plot_name.replace('_', ' ').title()}",
-                                elements=[image],
-                            ).send()
+                            try:
+                                await cl.Message(
+                                    content=f"### {plot_name.replace('_', ' ').title()}",
+                                    elements=[image],
+                                ).send()
+                            except (GeneratorExit, RuntimeError, Exception) as e:
+                                logger.warning(
+                                    "Failed to inline diagnostic image %r: %s",
+                                    plot_name, e,
+                                )
+                                try:
+                                    await cl.Message(
+                                        content=(
+                                            f"### {plot_name.replace('_', ' ').title()}\n\n"
+                                            "⚠️ Rendering the inline image failed. Say "
+                                            f"`Plot the {plot_name.replace('_', ' ')}` and I'll re-generate it."
+                                        )
+                                    ).send()
+                                except (GeneratorExit, RuntimeError, Exception):
+                                    pass
 
                     if dp_error is None and dp_output:
                         # Non-blocking: users may ask post-run inspection questions immediately.

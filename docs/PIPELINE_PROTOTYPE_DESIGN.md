@@ -892,3 +892,148 @@ The following constants are hardcoded in source and are **never shown to the hum
 | `CONNECTIVITY_CSV_FILENAME_TEMPLATE` | `"{metric}_{run_id}.csv"` | Per-metric connectivity matrix CSV filename format (written to `OUTPUT_DIR`) |
 | `EVIDENCE_CSV_FILENAME_TEMPLATE` | `"evidence_summary_{run_id}.csv"` | Complementary evidence synthesis CSV filename format (written to `OUTPUT_DIR`) |
 | `EVALUATION_CSV_FILENAME_TEMPLATE` | `"evaluation_summary_{run_id}.csv"` | Evaluator sanity & artifact check summary CSV filename format (written to `OUTPUT_DIR`) |
+
+---
+
+## Appendix B — Connectivity Agent Planned Architecture (Node 3)
+
+> **Status: Planned, not implemented.** This section documents the agreed design
+> for the Connectivity Agent (Node 3) so the user can approve/reject before
+> code is written. Per standing instructions, Node 3 is **not built until the
+> user explicitly asks**.
+
+### B.1 Node 3 role in the graph
+
+Node 3 sits between Node 2 (Data Preparation) and Node 4 (Evaluator) on the 5-Node DAG:
+
+- **Input:** `preprocessed_data_path` (epoched `.fif` produced by Node 2), the
+  accepted `AnalysisPlan` (band, channels, condition, 1–5 MetricEnum values,
+  epoch parameters), and the `DataPrepSummary` from Node 2.
+- **Output:**
+  1. One CSV per requested metric, each containing an `N×N` symmetric connectivity
+     matrix (`N = channels in plan`), written into `outputs/` using the
+     `CONNECTIVITY_CSV_FILENAME_TEMPLATE`.
+  2. One heatmap per metric + one circular network graph (strongest edges only,
+     40% density threshold — per `tests/unit/deterministic/test_connectivity.py`
+     spec) rendered as PNG into `outputs/`.
+  3. Per-metric `numerical_summaries: Dict[str, Dict[str, float]]` where each
+     metric maps to `{mean, std, top_5_pairs_mean, bottom_5_pairs_mean}` (keys
+     already defined in `schemas/state.py` lines 78–90).
+  4. The list-of-evidence payload (`metric_csv_paths`, `heatmap_image_paths`,
+     `network_image_paths`, `numerical_summaries`, `evidence_summary`) passed
+     downstream to the Evaluator and Synthesis nodes via the LangGraph state.
+
+### B.2 Agent design (`agentic/connectivity/agent.py`)
+
+The Connectivity Agent is a **pure deterministic orchestrator (ReAct-less)**.
+Per project principle *"agents plan/orchestrate; the LLM never computes"*, and
+unlike the Supervisor (Node 1), the Connectivity Agent performs **no LLM
+reasoning over EEG numbers**.  Its only job is:
+
+1. Load `ValidatedDataPrepParams` + `AnalysisPlan` from the graph state.
+2. Loop over the 1–5 requested `MetricEnum` values in the plan.
+3. For each metric, invoke the corresponding `toolbox.connectivity.*` tool
+   (see §B.3) with the epoched MNE data, band-pass `(fmin, fmax)`, and `sfreq`.
+4. Save the returned `N×N` ndarray as CSV, render the heatmap + network PNG
+   via `toolbox.visualization.*` (or via the existing connectivity plotting
+   shim).
+5. Compute per-metric numerical summaries deterministically (pure `numpy`).
+6. Attach outputs to state and return.
+
+If a metric tool would produce a singular matrix (e.g. zero-variance channel
+pair after cleaning), the tool raises a typed `ConnectivityComputationError`;
+the agent surfaces it as a Gate-2-style warning via the Evaluator rather than
+swallowing it.
+
+**Optional HITL pause (handover §5 open item 6):** Before dispatching the loop,
+the agent computes a coarse FLOPs estimate:
+`FLOPs ≈ epochs × channels² × FFT_size`.  If this exceeds a configured
+threshold, it emits a `Gate 1.5 / Expensive Computation Pause` offering the
+human three options — **Approve**, **Reject**, or **Reduce** (fewer bands,
+fewer channels, downsample).  This is the "before expensive compute" pause
+called out in handover open item 6.
+
+### B.3 Toolbox new group `toolbox/connectivity/`
+
+Following the central toolbox convention used by the 9 migrated data-prep
+tools, Node 3 computation lives as 5 leaf tool modules under
+`src/fc_pipeline/toolbox/connectivity/`, each exposing one pure, deterministic,
+LLM-free function over `mne.Epochs`:
+
+| Module | Function signature |
+| :--- | :--- |
+| `pli.py`       | `compute_pli(epochs, band: tuple[float, float], sfreq: float) → np.ndarray` |
+| `wpli.py`      | `compute_wpli(epochs, band, sfreq) → np.ndarray` |
+| `imcoh.py`     | `compute_imcoh(epochs, band, sfreq) → np.ndarray` |
+| `plv.py`       | `compute_plv(epochs, band, sfreq) → np.ndarray` |
+| `coherence.py` | `compute_coherence(epochs, band, sfreq) → np.ndarray` |
+
+Semantic guarantees:
+- **ImCoh absolute-value transform (per handover §1 project decision):**
+  `compute_imcoh` returns `abs(imag(Cxy)) / abs(Cxy)` averaged over the band
+  (result is always in `[0, 1]`; the raw signed imaginary component is **never**
+  returned to any downstream node).
+- `toolbox/connectivity/__init__.py` exports all 5 functions.
+- `toolbox/registry.py` registers them with `allowed_agents={"connectivity"}`,
+  `execution_mode="deterministic"`, `pipeline_stage="connectivity"`, and
+  `requires_prerequisites={"data_prep"}` — matching the same registry contract
+  used by the 9 migrated data-prep tools.
+- Existing `deterministic/connectivity/metrics.py` and `plotting.py` become
+  **zero-logic re-export shims** (same pattern as
+  `deterministic/data_prep/cleaning.py`).
+
+### B.4 Registry scoping
+
+The Supervisor agent's `_compute_scoped_tools` helper (in `agentic/supervisor/`)
+already filters the registry by `allowed_agents` and `pipeline_stage`.  Because
+the new connectivity tools set `allowed_agents={"connectivity"}` and
+`pipeline_stage != "supervisor"`, they are **automatically excluded** from the
+Supervisor's tool list without any code changes to `supervisor/agent.py`
+(respecting the standing rule *"never touch supervisor/agent.py unless I ask"*).
+
+### B.5 Evaluator (Node 4) interaction
+
+After Node 3 returns, Node 4 (Evaluator) reads:
+
+1. **Deterministic sanity checks** from `deterministic.sanity_checks.matrix_checks`:
+   - matrix is symmetric to numerical tolerance,
+   - diagonal entries equal `1.0` for `{Coherence, PLV}` where applicable,
+   - `ImCoh ∈ [0, 1]`, `PLI ∈ [0, 1]`, values are finite (no NaN/Inf),
+   - PSD-based shape sanity (FFT output count matches expectation).
+2. **Optional VLM review** via `evaluator/vlm_client.py` over each heatmap PNG
+   — the VLM is *only* asked "does this image look like a correctly-rendered
+   `N×N` viridis heatmap on a `[0,1]` scale with channel labels present and
+   readable?"; it never invents scientific numbers.
+3. Writes `evaluation_summary_csv_path` via `csv_writer.py` and emits
+   `evaluation_verdict = {"quality": "pass" | "warn" | "fail", "issues": [...]}`
+   into the graph state.
+
+Open item 6 (from handover §5): if `quality == "warn"`, Evaluator may request
+an explicit human sign-off pause before Synthesis proceeds.
+
+### B.6 Synthesis (Node 5)
+
+Node 5 reads the Evaluator verdict + Connectivity outputs + Data Prep summary
+and writes the final Markdown report via `synthesis/report_builder.py` to
+`final_report_path`.  The report is strictly evidence-grounded:
+
+- Every per-metric claim is accompanied by the exact `numerical_summaries`
+  values (mean, std, top/bottom-5) quoted verbatim from Node 3.
+- Every plot (heatmap/network) is referenced by path and, where the target
+  format supports it, embedded inline.
+- Every CSV matrix is linked so the reader can reproduce downstream analysis.
+- **No LLM invention of numbers** — per handover §1 project principle.
+
+### B.7 Not-yet-decided / open items (from handover §5)
+
+These items remain TBD by the user before Node 3 implementation begins:
+
+| Item | Handover reference | Current plan |
+| :--- | :--- | :--- |
+| (4) 5 fixed metrics vs prototype v1's "PLI + Coherence only" | §5 item 4 | Current plan supports all 5 (`pli`, `wpli`, `plv`, `imcoh`, `coherence` / `coh`), consistent with `MetricEnum` and `config/metric_canonicalization.py`. User may scope this down. |
+| (5) Evaluator + Synthesis activation | §5 item 5 | Plan includes them as Nodes 4/5 (matching `schemas/state.py` lines 85–90). Activation as *required vs optional* stages is TBD. |
+| (6) Explicit human gates before expensive compute + Evaluator warn gate | §5 item 6 | Plan includes both as optional interrupts (Gate 1.5 pre-connectivity, and Evaluator-warn sign-off). Enabling/disabling them is a config-level switch. |
+
+No Node 3 code, tests, or registry entries have been written; this section
+exists purely so the user can approve / revise the architecture before
+implementation begins.
