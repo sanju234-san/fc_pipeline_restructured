@@ -32,3 +32,23 @@ METRIC_LOOKUP: Dict[str, MetricInfo] = {
     "coherence": {"canonical_id": MetricEnum.COHERENCE, "group": "Zero-Lag-Inclusive"},
     "spectral coherence": {"canonical_id": MetricEnum.COHERENCE, "group": "Zero-Lag-Inclusive"},
 }
+
+CANONICAL_METRICS = [m.value for m in MetricEnum]
+METRIC_ALIASES = list(METRIC_LOOKUP.keys())
+METRIC_GROUPS = {
+    MetricEnum.PLI: "Phase-Robust",
+    MetricEnum.WPLI: "Phase-Robust",
+    MetricEnum.IMAGINARY_COHERENCE: "Phase-Robust",
+    MetricEnum.PLV: "Zero-Lag-Inclusive",
+    MetricEnum.COHERENCE: "Zero-Lag-Inclusive",
+}
+
+
+def canonicalize_metric(metric_str: str):
+    """Normalizes a raw user input string to a canonical MetricEnum, or None if unsupported."""
+    clean = metric_str.strip().lower()
+    info = METRIC_LOOKUP.get(clean)
+    if info:
+        return info["canonical_id"]
+    return None
+

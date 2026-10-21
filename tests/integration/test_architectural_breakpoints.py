@@ -126,7 +126,8 @@ class TestArchitecturalBreakpoints:
         )
 
         executed_nodes = []
-        with patch("fc_pipeline.pipeline.nodes.transform_query", return_value=mock_qt_res):
+        with patch("fc_pipeline.pipeline.nodes.apply_input_rail", return_value=None), \
+             patch("fc_pipeline.pipeline.nodes.transform_query", return_value=mock_qt_res):
             for mode, payload in compiled_app.stream(initial_state, config=config, stream_mode=["updates"]):
                 if mode == "updates":
                     executed_nodes.extend(payload.keys())

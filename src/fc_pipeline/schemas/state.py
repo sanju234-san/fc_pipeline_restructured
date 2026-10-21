@@ -82,6 +82,7 @@ class GraphState(TypedDict):
     network_image_paths: Optional[Dict[str, str]]
     numerical_summaries: Optional[Dict[str, Dict[str, float]]]
     evidence_summary: Optional[List[Any]]
+    consolidated_report_path: Optional[str]
 
     # 4. Evaluator Outputs (Placeholders for Node 4)
     evaluation_verdict: Optional[Any]

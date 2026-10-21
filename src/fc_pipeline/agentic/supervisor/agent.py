@@ -33,6 +33,7 @@ from fc_pipeline.toolbox.dataset import (
     REGION_MAP,
     normalize_channel_label,
 )
+from fc_pipeline.pipeline.context_management import DeepAgentsContextManager
 
 
 # Available Supervisor inspection tools sourced from centralized toolbox registry (5 total)
@@ -608,6 +609,11 @@ def supervisor_node(
     tracer = SupervisorTracer(run_id=run_id)
     tracer.log_event("supervisor_start", {"user_request": user_request, "raw_data_path": raw_data_path})
 
+    # Deep Agents context management for this thread
+    context_mgr = DeepAgentsContextManager(thread_id=run_id, llm=llm)
+    retrieval_tools = context_mgr.build_retrieval_tools()
+    retrieval_map = {t.name: t for t in retrieval_tools}
+
     # Sub-part 1: Tool isolation — initialize dynamic binding trackers
     bound_tool_names: set[str] = set()
     llm_with_tools = llm
@@ -759,16 +765,23 @@ def supervisor_node(
 
             elif meta.pipeline_stage == "resolution":
                 if t_name == "resolve_frequency_band":
-                    if not (resolved_band_info and not resolved_band_info.get("error")):
+                    band_firm = resolved_band_info and not resolved_band_info.get("error") and resolved_band_info.get("source") != "user_default"
+                    if not band_firm:
                         scoped.append(tool_fn)
                 elif t_name == "resolve_channel_selection":
-                    if not (resolved_channel_info and not resolved_channel_info.get("error")):
+                    chan_firm = resolved_channel_info and not resolved_channel_info.get("error") and resolved_channel_info.get("source") != "user_default"
+                    if not chan_firm:
                         scoped.append(tool_fn)
 
             elif meta.pipeline_stage == "diagnostic":
                 if t_name == "generate_dataset_overview_plot":
                     if has_plot_intent and not plot_completed:
                         scoped.append(tool_fn)
+
+        # Deep Agents: expose context retrieval tools when offloaded results exist
+        if context_mgr.offload_registry:
+            for r_tool in retrieval_tools:
+                scoped.append(r_tool)
 
         return scoped
 
@@ -798,16 +811,25 @@ def supervisor_node(
             "scoped_tools": sorted(list(iteration_scoped_tool_names)),
         })
 
+        # Deep Agents: automatic conversation compression before invocation if token budget exceeded
+        if context_mgr.should_summarize(messages):
+            messages = context_mgr.summarize_messages(messages)
+
         try:
             response: AIMessage = llm_with_tools.invoke(messages)
         except (ValueError, Exception) as _llm_err:
-            # Groq (and other providers) can return a completely empty response
-            # after rate-limit retries, which LangChain raises as:
-            #   ValueError: model output must contain either output text or tool calls
-            # Treat this as a graceful loop exit — the outer halt logic will
-            # emit a clarification question instead of crashing the pipeline.
             _err_str = str(_llm_err)
-            if _is_provider_tool_rejection(_llm_err):
+            # Deep Agents: recover from context length overflows via aggressive summarization
+            if any(term in _err_str.lower() for term in ("context length", "maximum context", "token limit", "too many tokens", "reduce your prompt")):
+                tracer.log_event("context_overflow_recovered", {"error": _err_str})
+                try:
+                    messages = context_mgr.summarize_messages(messages, preserved_tail=2)
+                    response = llm_with_tools.invoke(messages)
+                except Exception as _retry_err:
+                    tracer.log_event("context_overflow_retry_failed", {"error": str(_retry_err)})
+                    loop_exhausted = True
+                    break
+            elif _is_provider_tool_rejection(_llm_err):
                 tool_rejections += 1
                 _rejected = _rejected_tool_name(_llm_err)
                 tracer.log_event("tool_scope_violation", {
@@ -827,14 +849,15 @@ def supervisor_node(
                     )
                 )
                 continue
-            if "model output" in _err_str or "tool calls" in _err_str or "output text" in _err_str:
+            elif "model output" in _err_str or "tool calls" in _err_str or "output text" in _err_str:
                 tracer.log_event("llm_empty_response", {
                     "iteration": iteration + 1,
                     "error": _err_str,
                 })
                 loop_exhausted = True
                 break
-            raise  # re-raise unexpected errors
+            else:
+                raise  # re-raise unexpected errors
 
         # Normalise content — some providers return None instead of ""
         if response.content is None:
@@ -892,7 +915,7 @@ def supervisor_node(
                 elif t_name == "resolve_channel_selection":
                     attempted_channel_selection = True
 
-                tool_fn = TOOL_MAP.get(t_name)
+                tool_fn = TOOL_MAP.get(t_name) or retrieval_map.get(t_name)
                 # Deterministically pass actual duration and sfreq to resolve_frequency_band (NEVER fabricate duration)
                 actual_duration = dataset_duration_seconds or state.get("dataset_duration_seconds")
                 actual_sfreq = dataset_sfreq or state.get("dataset_sfreq")
@@ -912,7 +935,7 @@ def supervisor_node(
                 # not honoured inside this loop (interrupt() would replay the whole
                 # node, re-running LLM calls), so it is treated as a deny here.
                 policy_block: Optional[str] = None
-                if tool_fn:
+                if tool_fn and t_name not in retrieval_map:
                     tool_decision = evaluate_action(t_name, t_args, {"run_id": run_id})
                     if (
                         tool_decision.behavior == DecisionType.ALLOW_WITH_MODIFIED_INPUT
@@ -981,6 +1004,9 @@ def supervisor_node(
                     condition_candidates = _condition_candidates_from_request(
                         user_request, list(observation.get("conditions", {}).keys())
                     )
+                    if resolved_condition and observation["conditions"] and resolved_condition not in observation["conditions"]:
+                        resolved_condition = None
+                        tool_confidences.pop("condition", None)
                     match = resolve_condition_from_request(user_request, observation["conditions"])
                     if match is not None:
                         resolved_condition = match
@@ -988,15 +1014,49 @@ def supervisor_node(
 
                 # Append tool observation back to messages
                 call_id = tool_call.get("id", "fallback_id")
-                messages.append(ToolMessage(tool_call_id=call_id, content=str(observation)))
+                if t_name in retrieval_map:
+                    messages.append(ToolMessage(tool_call_id=call_id, content=str(observation)))
+                else:
+                    stub, record = context_mgr.maybe_offload_tool_result(t_name, observation, call_id)
+                    if record is not None:
+                        tracer.log_event("context_offload", {
+                            "tool": t_name,
+                            "record_id": record.record_id,
+                            "path": str(record.file_path),
+                            "char_length": record.char_length,
+                        })
+                        messages.append(ToolMessage(tool_call_id=call_id, content=stub))
+                    else:
+                        messages.append(ToolMessage(tool_call_id=call_id, content=str(observation)))
         else:
             # No tool calls: LLM finished reasoning
             loop_exhausted = False
             break
 
+    # Ground resolved channels and condition against actual dataset before guardrail evaluation
+    if resolved_channel_info and dataset_available_channels:
+        clean_avail = {normalize_channel_label(ch) for ch in dataset_available_channels}
+        clean_req = {normalize_channel_label(ch) for ch in (resolved_channel_info.get("resolved_channels") or [])}
+        if not clean_req or not clean_req.issubset(clean_avail):
+            resolved_channel_info = None
+            tool_confidences.pop("channels", None)
+    if resolved_condition and resolved_condition_counts:
+        if resolved_condition not in resolved_condition_counts:
+            resolved_condition = None
+            tool_confidences.pop("condition", None)
+
     # Sub-part 3: Structural Guardrail Evaluation across all 3 Scientific Axes
-    band_ok = bool(resolved_band_info and not resolved_band_info.get("error"))
-    channels_ok = bool(resolved_channel_info and not resolved_channel_info.get("error"))
+    # Persistent user defaults must not silently bypass human clarification per Requirement 7
+    band_ok = bool(
+        resolved_band_info
+        and not resolved_band_info.get("error")
+        and resolved_band_info.get("source") != "user_default"
+    )
+    channels_ok = bool(
+        resolved_channel_info
+        and not resolved_channel_info.get("error")
+        and resolved_channel_info.get("source") != "user_default"
+    )
     condition_ok = bool(resolved_condition)
 
     axis_resolution_attempted = (
