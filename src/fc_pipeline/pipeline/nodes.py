@@ -77,6 +77,27 @@ def _check_rail(rail_type: str, messages: List[Dict[str, Any]]) -> Dict[str, Any
         return {"status": "error", "content": "", "rail": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
+async def _check_rail_async(rail_type: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Runs one NeMo rail point asynchronously. Never raises: infra failures become status='error'."""
+    try:
+        from nemoguardrails.rails.llm.options import RailType
+
+        rt = RailType.INPUT if rail_type == "input" else RailType.OUTPUT
+        result = await _get_rails().check_async(messages, rail_types=[rt])
+        logger.info(
+            "NeMo %s rail async result: status=%s rail=%s", rail_type, result.status.value, result.rail
+        )
+        return {
+            "status": result.status.value,  # passed | modified | blocked
+            "content": result.content,
+            "rail": result.rail,
+            "error": None,
+        }
+    except Exception as exc:
+        logger.warning("NeMo %s rail async could not run: %s: %s", rail_type, type(exc).__name__, exc)
+        return {"status": "error", "content": "", "rail": None, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _screen_with_rails(
     rail_type: str,
     text: str,
@@ -95,7 +116,7 @@ def _screen_with_rails(
     if rail_type == "input":
         # Plainly in-scope, marker-free EEG requests skip the LLM classifier,
         # which small models answer unreliably (see rail_prefilter.py).
-        if is_obviously_in_scope(text):
+        if is_obviously_in_scope(text) or (user_text and is_obviously_in_scope(user_text)):
             logger.info("NeMo input rail skipped by deterministic pre-filter (in-scope EEG request).")
             return None
         messages: List[Dict[str, Any]] = [{"role": "user", "content": text}]
@@ -131,6 +152,49 @@ def _screen_with_rails(
     )
 
 
+async def _screen_with_rails_async(
+    rail_type: str,
+    text: str,
+    *,
+    user_text: str = "",
+    evidence: Optional[Any] = None,
+    run_id: Optional[str] = None,
+) -> Optional[Decision]:
+    """Async variant of _screen_with_rails for async handlers (Chainlit event loops)."""
+    if not _rails_enabled() or not text:
+        return None
+
+    if rail_type == "input":
+        if is_obviously_in_scope(text) or (user_text and is_obviously_in_scope(user_text)):
+            logger.info("NeMo input rail skipped by deterministic pre-filter (in-scope EEG request).")
+            return None
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": text}]
+    else:
+        evidence_text = evidence if isinstance(evidence, str) else json.dumps(evidence, default=str)
+        messages = [
+            {
+                "role": "context",
+                "content": {"check_facts": True, "relevant_chunks": evidence_text[:_EVIDENCE_CHAR_LIMIT]},
+            },
+            {"role": "user", "content": user_text or ""},
+            {"role": "assistant", "content": text},
+        ]
+
+    result = await _check_rail_async(rail_type, messages)
+    return evaluate_action(
+        f"nemo_{rail_type}_rail",
+        {"text": text},
+        {
+            "rail_status": result["status"],
+            "rail": result["rail"],
+            "error": result["error"],
+            "modified_text": result["content"],
+            "flagged_text": text,
+            "run_id": run_id,
+        },
+    )
+
+
 def apply_input_rail(state: GraphState, text: str) -> Optional[Dict[str, Any]]:
     """Input rail, called at the top of the Query Transformer node.
 
@@ -140,7 +204,12 @@ def apply_input_rail(state: GraphState, text: str) -> Optional[Dict[str, Any]]:
     if state.get("input_rail_cleared"):
         return None  # a human already reviewed and cleared this exact input
 
-    decision = _screen_with_rails("input", text, run_id=state.get("run_id"))
+    decision = _screen_with_rails(
+        "input",
+        text,
+        user_text=state.get("user_request") or "",
+        run_id=state.get("run_id"),
+    )
     if decision is None or decision.behavior in (
         DecisionType.ALLOW,
         DecisionType.ALLOW_WITH_MODIFIED_INPUT,  # input self-check never rewrites; treat as pass
@@ -351,4 +420,17 @@ def data_prep_node_adapter(state: GraphState) -> Dict[str, Any]:
         logger.error("Data Preparation failed: %s", result.error)
 
     return update
+
+
+def connectivity_node_adapter(state: GraphState) -> Dict[str, Any]:
+    """LangGraph node adapter for the deterministic Connectivity Analysis stage (Node 3).
+
+    Dispatches to run_connectivity_agent which loads preprocessed data, computes
+    single-pass spectral connectivity across requested metrics, renders heatmaps and
+    network graphs, computes numerical summaries, and performs 4-category classification.
+    """
+    from fc_pipeline.agentic.connectivity.agent import run_connectivity_agent
+
+    return run_connectivity_agent(state)
+
 

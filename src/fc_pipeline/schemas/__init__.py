@@ -8,6 +8,55 @@ supported and equivalent.
 """
 
 # ---------------------------------------------------------------------------
+# schemas.enums — Canonical enums
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.enums import (  # noqa: F401
+    EvidenceCategoryEnum,
+    MetricEnum,
+    OverallVerdictEnum,
+    VisualTopologyReadEnum,
+)
+
+# ---------------------------------------------------------------------------
+# schemas.plan — FrequencyBand and AnalysisPlan
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.plan import (  # noqa: F401
+    AnalysisPlan,
+    FrequencyBand,
+)
+
+# ---------------------------------------------------------------------------
+# schemas.manifest — ParameterManifestEntry
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.manifest import (  # noqa: F401
+    ParameterManifestEntry,
+)
+
+# ---------------------------------------------------------------------------
+# schemas.evidence — PairEvidenceSynthesis
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.evidence import (  # noqa: F401
+    PairEvidenceSynthesis,
+)
+
+# ---------------------------------------------------------------------------
+# schemas.evaluation — EvaluationVerdict and components
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.evaluation import (  # noqa: F401
+    ArtifactDetectionResult,
+    ArtifactSignatures,
+    EvaluationVerdict,
+    SanityCheckFlags,
+)
+
+# ---------------------------------------------------------------------------
+# schemas.state — GraphState TypedDict
+# ---------------------------------------------------------------------------
+from fc_pipeline.schemas.state import (  # noqa: F401
+    GraphState,
+)
+
+# ---------------------------------------------------------------------------
 # schemas.data_prep_models — Data Prep pydantic contracts (leaf package)
 # ---------------------------------------------------------------------------
 from fc_pipeline.schemas.data_prep_models import (  # noqa: F401
@@ -32,6 +81,25 @@ from fc_pipeline.schemas.data_prep_contracts import (  # noqa: F401
 )
 
 __all__ = [
+    # enums
+    "MetricEnum",
+    "EvidenceCategoryEnum",
+    "VisualTopologyReadEnum",
+    "OverallVerdictEnum",
+    # plan
+    "FrequencyBand",
+    "AnalysisPlan",
+    # manifest
+    "ParameterManifestEntry",
+    # evidence
+    "PairEvidenceSynthesis",
+    # evaluation
+    "SanityCheckFlags",
+    "ArtifactDetectionResult",
+    "ArtifactSignatures",
+    "EvaluationVerdict",
+    # state
+    "GraphState",
     # data_prep_models
     "DataPrepInput",
     "ValidatedDataPrepParams",
@@ -47,4 +115,3 @@ __all__ = [
     "REFERENCE_ALIASES",
     "RECOGNISED_UNSUPPORTED_REFERENCES",
 ]
-

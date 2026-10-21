@@ -21,6 +21,7 @@ from fc_pipeline.agentic.supervisor.action_policy import (
 )
 from fc_pipeline.pipeline.nodes import (
     apply_output_rail,
+    connectivity_node_adapter,
     data_prep_node_adapter,
     supervisor_node_adapter,
     query_transformer_node_adapter,
@@ -115,6 +116,19 @@ def gate_1_review(state: GraphState) -> Dict[str, Any]:
         return update
 
     if action == "approve":
+        # Trustworthy approval requirement: explicit plan must exist in state
+        if state.get("plan") is None:
+            return {
+                "preflight_confirmed": False,
+                "gate_1_approved": False,
+            }
+        # If payload carries run_id, verify it matches current interrupted execution
+        if isinstance(decision, dict) and decision.get("run_id"):
+            if str(decision["run_id"]) != str(state.get("run_id")):
+                return {
+                    "preflight_confirmed": False,
+                    "gate_1_approved": False,
+                }
         return {
             "preflight_confirmed": True,
             "gate_1_approved": True,
@@ -141,6 +155,20 @@ def route_gate_1_output(state: GraphState) -> str:
     if state.get("preflight_confirmed") and state.get("gate_1_approved"):
         return "data_prep"
     return END
+
+
+def route_data_prep_output(state: GraphState) -> str:
+    """Evaluates Data Preparation output to determine next pipeline step.
+
+    - If data_prep_error is present or preprocessed_data_path is missing: halts at END.
+    - If data preparation succeeded with a valid FIF artifact: routes to Node 3 (connectivity_analysis).
+    """
+    if state.get("data_prep_error"):
+        return END
+    if state.get("preprocessed_data_path"):
+        return "connectivity_analysis"
+    return END
+
 
 
 def informational_complete(state: GraphState) -> Dict[str, Any]:
@@ -313,6 +341,7 @@ def build_pipeline_graph() -> StateGraph:
     graph.add_node("supervisor", supervisor_node_adapter)
     graph.add_node("gate_1_review", gate_1_review)
     graph.add_node("data_prep", data_prep_node_adapter)
+    graph.add_node("connectivity_analysis", connectivity_node_adapter)
     graph.add_node("informational_complete", informational_complete)
     graph.add_node("clarification_pause", clarification_pause)
     graph.add_node("supervisor_error", supervisor_error)
@@ -366,8 +395,19 @@ def build_pipeline_graph() -> StateGraph:
         },
     )
 
-    # Terminal / clarification edges
-    graph.add_edge("data_prep", END)
+    # Data Preparation conditional routing to Connectivity Analysis (Node 3) or END
+    graph.add_conditional_edges(
+        "data_prep",
+        route_data_prep_output,
+        {
+            "connectivity_analysis": "connectivity_analysis",
+            END: END,
+        },
+    )
+
+    # Connectivity Analysis terminal edge (or downstream Evaluator in future Node 4)
+    graph.add_edge("connectivity_analysis", END)
+
     graph.add_conditional_edges(
         "clarification_pause",
         route_clarification_output,

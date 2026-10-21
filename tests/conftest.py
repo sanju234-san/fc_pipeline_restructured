@@ -13,6 +13,14 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_memory(tmp_path_factory, monkeypatch):
+    """Ensure test suite runs in an isolated user_memory directory so local developer preference files are never read."""
+    temp_mem = tmp_path_factory.mktemp("test_user_memory")
+    monkeypatch.setenv("FC_PIPELINE_USER_MEMORY_DIR", str(temp_mem))
+
+
+
 @pytest.fixture(scope="session")
 def synthetic_eeg_path(tmp_path_factory):
     """Create a small 10-20 synthetic EEG .fif file once per test session.

@@ -181,38 +181,64 @@ def _run(
     raw, ref_applied = apply_reference(raw, params)
     _trace(params.run_id, "data_prep_stage", {"stage": "reference", "status": "completed", "reference_applied": ref_applied})
 
-    # ── 6. Select the analysis channels and drop flagged ones ──────────
+    # ── 5b. Build a full-montage copy for the viewer & diagnostics ─────
+    #    After referencing, keep a copy of ALL channels (minus genuine
+    #    flatlines) so the interactive "After Data Prep" viewer can scroll
+    #    through the complete channel set.  Only genuinely flatline
+    #    channels (pre_flagged) are removed here; the connectivity node
+    #    already subselects plan channels from the saved epochs, so
+    #    saving the full montage is safe and does not break downstream.
+    raw_full = raw.copy()
+    if pre_flagged:
+        chans_to_drop = [ch for ch in pre_flagged if ch in raw_full.ch_names]
+        if chans_to_drop:
+            raw_full.drop_channels(chans_to_drop)
+    # Clear bads list so filter_and_epoch operates on every surviving channel
+    raw_full.info["bads"] = []
+
+    # ── 6. Compute channel-selection summary (analysis channels only) ──
+    #    clean_bad_channels subselects params.channels and drops flatlines.
+    #    We call it on a *copy* of raw so raw_full remains untouched.
     _trace(params.run_id, "data_prep_stage", {"stage": "channel_selection", "status": "started"})
-    raw, dropped_channels = clean_bad_channels(raw, params, pre_flagged=pre_flagged)
-    retained_channel_count = len(raw.ch_names)
+    raw_analysis = raw.copy()
+    raw_analysis, dropped_channels = clean_bad_channels(raw_analysis, params, pre_flagged=pre_flagged)
+    retained_channel_count = len(raw_analysis.ch_names)
     _trace(params.run_id, "data_prep_stage", {
         "stage": "channel_selection", "status": "completed",
         "dropped_channels": dropped_channels, "retained_channel_count": retained_channel_count,
     })
 
-    # ── 6b. Filter + epoch ─────────────────────────────────────────────
+    # ── 6b. Filter + epoch the full montage ────────────────────────────
+    #    epoch_duration is derived from the full-montage epochs so that
+    #    the summary is consistent with what connectivity will see.
     _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "started", "fmin": params.fmin, "fmax": params.fmax, "condition": params.condition})
-    epochs = filter_and_epoch(raw, params)
+    epochs_all = filter_and_epoch(raw_full, params)
     # Real epoch length = samples / sfreq (tmax is inclusive in MNE).
-    epoch_duration = len(epochs.times) / epochs.info["sfreq"]
-    _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "completed", "epoch_count": len(epochs), "epoch_duration_seconds": epoch_duration})
+    epoch_duration = len(epochs_all.times) / epochs_all.info["sfreq"]
+    _trace(params.run_id, "data_prep_stage", {"stage": "filter_and_epoch", "status": "completed", "epoch_count": len(epochs_all), "epoch_duration_seconds": epoch_duration})
 
-    # ── 7. Diagnostic plots ────────────────────────────────────────────
+    # ── 7. Diagnostic plots (full montage) ────────────────────────────
+    #    Pass epochs_all so channels_after and channel_variance plots
+    #    reflect the complete set of preprocessed channels, not only the
+    #    3 analysis channels.
     _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "started"})
     plot_dir.mkdir(parents=True, exist_ok=True)
-    plot_paths = generate_diagnostics(epochs, params, plot_dir)
+    plot_paths = generate_diagnostics(epochs_all, params, plot_dir)
     if before_plot:
         plot_paths = {"channels_before": before_plot, **plot_paths}
     _trace(params.run_id, "data_prep_stage", {"stage": "diagnostics", "status": "completed", "plot_count": len(plot_paths), "plot_names": list(plot_paths.keys())})
 
-    # ── 8. Save processed epochs ───────────────────────────────────────
+    # ── 8. Save processed epochs (full montage) ────────────────────────
+    #    The connectivity executor reads plan_channels from the saved
+    #    epochs and subselects them (lines 130-146 in its executor.py),
+    #    so saving the full montage here is fully backward-compatible.
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = build_safe_output_path(
         output_dir, params.run_id, "preprocessed_epo", ".fif"
     )
-    epochs.save(str(output_path), overwrite=True, verbose=False)
+    epochs_all.save(str(output_path), overwrite=True, verbose=False)
     _trace(params.run_id, "data_prep_stage", {"stage": "save", "status": "completed", "output_file": output_path.name})
-    logger.info("Preprocessed epochs saved: %s", output_path.name)
+    logger.info("Preprocessed epochs saved: %s (%d channels)", output_path.name, len(epochs_all.ch_names))
 
     # ── 9. Build result ────────────────────────────────────────────────
     summary = DataPrepSummary(
@@ -224,7 +250,7 @@ def _run(
         reference_detected=None,
         reference_applied=ref_applied,
         condition=params.condition,
-        epoch_count=len(epochs),
+        epoch_count=len(epochs_all),
         epoch_duration_seconds=round(epoch_duration, 4),
         filter_l_freq=params.fmin,
         filter_h_freq=params.fmax,

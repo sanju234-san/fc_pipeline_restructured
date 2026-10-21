@@ -180,5 +180,75 @@ def _initialize_default_registry() -> None:
     )
 
 
+def register_connectivity_tools(registry: Optional[ToolboxRegistry] = None) -> None:
+    """Registers deterministic connectivity tools in the specified or default registry."""
+    reg = registry or toolbox_registry
+    from fc_pipeline.toolbox.connectivity import (
+        compute_coherence,
+        compute_imcoh,
+        compute_pli,
+        compute_plv,
+        compute_wpli,
+    )
+
+    reg.register(
+        name="compute_pli",
+        category="connectivity",
+        description="Computes symmetric Phase Lag Index (PLI) matrix over specified frequency band.",
+        callable_obj=compute_pli,
+        allowed_agents=["connectivity"],
+        execution_mode="deterministic",
+        pipeline_stage="connectivity",
+        requires_prerequisites=["data_prep"],
+        state_changing=False,
+    )
+    reg.register(
+        name="compute_wpli",
+        category="connectivity",
+        description="Computes symmetric Weighted Phase Lag Index (wPLI) matrix over specified frequency band.",
+        callable_obj=compute_wpli,
+        allowed_agents=["connectivity"],
+        execution_mode="deterministic",
+        pipeline_stage="connectivity",
+        requires_prerequisites=["data_prep"],
+        state_changing=False,
+    )
+    reg.register(
+        name="compute_imcoh",
+        category="connectivity",
+        description="Computes symmetric absolute Imaginary Coherence (|ImCoh|) matrix over specified frequency band.",
+        callable_obj=compute_imcoh,
+        allowed_agents=["connectivity"],
+        execution_mode="deterministic",
+        pipeline_stage="connectivity",
+        requires_prerequisites=["data_prep"],
+        state_changing=False,
+    )
+    reg.register(
+        name="compute_plv",
+        category="connectivity",
+        description="Computes symmetric Phase Locking Value (PLV) matrix over specified frequency band.",
+        callable_obj=compute_plv,
+        allowed_agents=["connectivity"],
+        execution_mode="deterministic",
+        pipeline_stage="connectivity",
+        requires_prerequisites=["data_prep"],
+        state_changing=False,
+    )
+    reg.register(
+        name="compute_coherence",
+        category="connectivity",
+        description="Computes symmetric Spectral Coherence matrix over specified frequency band.",
+        callable_obj=compute_coherence,
+        allowed_agents=["connectivity"],
+        execution_mode="deterministic",
+        pipeline_stage="connectivity",
+        requires_prerequisites=["data_prep"],
+        state_changing=False,
+    )
+
+
 # Automatically populate registry on module import
 _initialize_default_registry()
+
+

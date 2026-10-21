@@ -1,0 +1,105 @@
+/* FC Pipeline — layout fixes.
+ *
+ * 1) No page-level horizontal scrollbar, WITHOUT hiding scrollbars globally:
+ *    wide content scrolls inside its own container instead of widening the page.
+ * 2) Vertical scrolling and internal scrolling (preview table, long documents,
+ *    code blocks) are preserved.
+ */
+
+/* Page level: never wider than the viewport. `clip` (unlike `hidden`) does not
+ * create a scroll container, so vertical scrolling is unaffected. */
+html,
+body,
+#root {
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+/* Flex/grid children may shrink below their content width; otherwise a wide
+ * message pushes the whole chat column (and its scroll area) sideways. */
+#root div {
+  min-width: 0;
+}
+
+/* Any strip of inline file chips wraps instead of running off-screen. */
+#root div:has(> a.inline-file) {
+  display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
+  gap: 0.5rem;
+}
+
+/* Chat markdown tables scroll inside themselves. The right-hand preview table
+ * (".dataframe") keeps its own layout/scroll behaviour. */
+#root table:not(.dataframe *) {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+#root pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+#root img,
+#root video,
+#root canvas {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Long unbroken strings (paths, run ids) wrap instead of overflowing. */
+#root p,
+#root li,
+#root code {
+  overflow-wrap: anywhere;
+}
+
+/* Right-hand preview panel: contents scroll inside the panel (both axes). */
+#side-view-content {
+  overflow: auto;
+  min-width: 0;
+}
+#side-view-content .dataframe,
+#side-view-content .dataframe > div {
+  max-width: 100%;
+  overflow-x: auto;
+}
+#side-view-content img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Preview table readability: keep every cell on one line (no per-character
+ * wrapping), size columns to their content, and scroll horizontally inside
+ * the panel when the table is wider than it. */
+#side-view-content .dataframe .overflow-y-auto,
+#side-view-content .dataframe .overflow-auto {
+  overflow-x: auto;
+  max-width: 100%;
+}
+#side-view-content .dataframe table {
+  display: table;
+  width: max-content;
+  min-width: 100%;
+  table-layout: auto;
+  border-collapse: collapse;
+}
+#side-view-content .dataframe th,
+#side-view-content .dataframe td,
+#side-view-content .dataframe td * {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: none;
+}
+#side-view-content .dataframe th {
+  padding: 0.5rem 1rem;
+  font-weight: 600;
+  text-align: left;
+}
+#side-view-content .dataframe td {
+  padding: 0.4rem 1rem;
+  font-variant-numeric: tabular-nums;
+}
