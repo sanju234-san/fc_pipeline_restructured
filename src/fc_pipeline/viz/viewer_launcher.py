@@ -105,6 +105,10 @@ async def launch_eeg_viewer(
         viewer's own status file (``interactive`` / ``static``), and only
         falls back to the preflight probe prediction on timeout.
     """
+
+    # Headless (e.g. Colab): no display -> skip PyQt5, caller falls back to browser viewer
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return ViewerLaunchResult(ok=False, mode="failed", reason="no display (headless)")
     plot_path = Path(plot_path)
     if not plot_path.exists():
         logger.warning("launch_eeg_viewer: path does not exist: %s", plot_path)

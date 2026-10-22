@@ -328,3 +328,28 @@ window.addEventListener('keydown', e => {{
 </body>
 </html>"""
     return html
+
+
+# --- real-signal scroll viewer (auto-added) ---
+import inspect as _inspect
+_build_plotly_figure_image = build_plotly_figure
+
+
+def _scroll_or_none(args, kwargs):
+    try:
+        from fc_pipeline.viz.scroll_figure import figure_for_plot
+        return figure_for_plot(*args, **kwargs)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("scroll viewer failed; using image viewer")
+        return None
+
+
+if _inspect.iscoroutinefunction(_build_plotly_figure_image):
+    async def build_plotly_figure(*args, **kwargs):
+        fig = _scroll_or_none(args, kwargs)
+        return fig if fig is not None else await _build_plotly_figure_image(*args, **kwargs)
+else:
+    def build_plotly_figure(*args, **kwargs):
+        fig = _scroll_or_none(args, kwargs)
+        return fig if fig is not None else _build_plotly_figure_image(*args, **kwargs)
