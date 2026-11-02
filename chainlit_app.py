@@ -4,8 +4,11 @@ import asyncio
 import datetime
 import json
 import shutil
+import socket
 import zipfile
-from urllib.request import urlopen, Request
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from urllib.parse import urlsplit
 import logging
 import os
@@ -355,7 +358,8 @@ async def _prompt_for_dataset() -> tuple[Path, bool, str]:
                 await cl.Message(
                     content=(
                         f"❌ **Dataset URL could not be downloaded/validated:** {mask_text(str(exc))}\n\n"
-                        "Please try another URL."
+                        "You can retry with a different URL, or choose "
+                        "**📁 Upload .fif / .edf / .zip** and provide the file directly."
                     )
                 ).send()
                 continue
@@ -368,33 +372,113 @@ def _download_dataset_url(url: str) -> Path:
 
     Handles query strings/tracking parameters, redirects, missing file
     extensions, and servers that return application/octet-stream.
+    Uses requests with retries for robust network handling.
     """
+    # Clean the URL: remove any non-printable characters or accidental whitespace
+    url = "".join(c for c in url if c.isprintable()).strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("Invalid URL: Must start with http:// or https://")
+
     download_dir = Path("outputs") / "uploaded_datasets"
     download_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     parsed = urlsplit(url)
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL: Could not identify a hostname in '{url}'")
+
     url_suffix = Path(parsed.path).suffix.lower()
 
-    req = Request(url, headers={"User-Agent": "EEG-FC-Pipeline/1.0"})
-    with urlopen(req, timeout=120) as src:
-        content_type = (src.headers.get("Content-Type") or "").lower()
-        disposition = src.headers.get("Content-Disposition") or ""
-        final_url = src.geturl() or url
-        final_suffix = Path(urlsplit(final_url).path).suffix.lower()
-        filename_hint = ""
-        match = re.search(r'filename[^;=]*=\s*["\']?([^"\';]+)', disposition, flags=re.I)
-        if match:
-            filename_hint = match.group(1).strip()
+    # Use a standard browser User-Agent to avoid being blocked by CDNs or firewalls
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/91.0.4472.124 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
 
-        suffix = Path(filename_hint).suffix.lower() or final_suffix or url_suffix
-        if suffix not in SUPPORTED_DATA_EXTENSIONS and suffix != ".zip":
-            if "zip" in content_type:
-                suffix = ".zip"
-            else:
-                suffix = ".bin"
-        destination = download_dir / f"remote_dataset_{stamp}{suffix}"
-        with open(destination, "wb") as dst:
-            shutil.copyfileobj(src, dst)
+    # Setup session with retries
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        raise_on_status=False
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount("http://", HTTPAdapter(max_retries=retries))
+
+    try:
+        # Using stream=True to handle large files and avoid memory issues
+        with session.get(url, headers=headers, timeout=(15, 120), stream=True, verify=True) as resp:
+            resp.raise_for_status()
+            
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            disposition = resp.headers.get("Content-Disposition") or ""
+            final_url = resp.url
+            final_suffix = Path(urlsplit(final_url).path).suffix.lower()
+            
+            filename_hint = ""
+            match = re.search(r'filename[^;=]*=\s*["\']?([^"\';]+)', disposition, flags=re.I)
+            if match:
+                filename_hint = match.group(1).strip()
+
+            suffix = Path(filename_hint).suffix.lower() or final_suffix or url_suffix
+            if suffix not in SUPPORTED_DATA_EXTENSIONS and suffix != ".zip":
+                if "zip" in content_type:
+                    suffix = ".zip"
+                else:
+                    suffix = ".bin"
+            
+            destination = download_dir / f"remote_dataset_{stamp}{suffix}"
+            with open(destination, "wb") as dst:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        dst.write(chunk)
+    except requests.exceptions.SSLError as exc:
+        raise RuntimeError(
+            f"TLS/SSL verification failed for '{parsed.netloc}': {exc}. "
+            "This usually means a TLS-intercepting proxy or a missing CA certificate. "
+            "SSL verification is deliberately NOT disabled; install the required CA "
+            "certificate, or download the file and upload it manually."
+        ) from exc
+    except requests.exceptions.ProxyError as exc:
+        raise RuntimeError(
+            f"Proxy connection failed while reaching '{parsed.netloc}': {exc}. "
+            "Check your HTTP_PROXY / HTTPS_PROXY settings, or upload the dataset manually."
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            f"Timed out contacting '{parsed.netloc}' (connect 15s / read 120s). "
+            "The host may be slow or unreachable; you can also download the file "
+            "and upload it manually."
+        ) from exc
+    except requests.exceptions.HTTPError as exc:
+        status = getattr(exc.response, "status_code", "?")
+        reason = getattr(exc.response, "reason", "")
+        raise RuntimeError(f"Server returned HTTP {status} {reason} for '{parsed.netloc}'.") from exc
+    except requests.exceptions.ConnectionError as exc:
+        # requests folds SSL/proxy/DNS failures into ConnectionError subclasses, so
+        # inspect the underlying cause to give accurate guidance instead of a
+        # blanket "could not connect".
+        cause = exc.__cause__
+        dns_failure = isinstance(cause, socket.gaierror) or "NameResolution" in type(cause).__name__
+        if dns_failure:
+            raise RuntimeError(
+                f"DNS resolution failed for '{parsed.netloc}'. Check the URL spelling "
+                "and your network/DNS settings, or upload the dataset manually."
+            ) from exc
+        raise RuntimeError(
+            f"Connection Failed: could not connect to '{parsed.netloc}'. Check your "
+            "internet connection, firewall, or proxy settings, or upload the dataset manually."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Network error while downloading from '{parsed.netloc}': {exc}") from exc
+
+    # A 200/206 response with an empty body must not be treated as a valid dataset.
+    if not destination.exists() or destination.stat().st_size == 0:
+        raise ValueError(f"The server returned an empty file for '{parsed.netloc}'.")
 
     # ZIP magic is more reliable than Content-Type when a server mislabels it.
     with open(destination, "rb") as fh:
@@ -1944,6 +2028,138 @@ async def _on_close_file_preview(action: cl.Action):
         logger.warning("Failed to close file preview: %s", e)
 
 
+@cl.action_callback("open_eeg_viewer")
+async def _on_open_eeg_viewer(action: cl.Action):
+    """Open the interactive EEG viewer with real channel navigation.
+
+    The **native PyQt5 desktop window is the primary experience** for EEG
+    channel plots (Channels Before / After): it scrolls through every channel
+    in the dataset (mouse wheel, ⬆/⬇ buttons, draggable scrollbar) with
+    horizontal time navigation and amplitude zoom.  The in-browser Plotly
+    viewer in the right-hand sidebar is a secondary, always-available view of
+    the same static plot.
+
+    The launcher reports the *actual* mode that started, so we never label a
+    degraded static-image window as an "Interactive Viewer".
+    """
+    payload = action.payload or {}
+    plot_path = payload.get("path", "")
+    plot_title = payload.get("title", "EEG Plot")
+
+    if not plot_path or not Path(str(plot_path)).exists():
+        await cl.Message(
+            content="⚠️ Cannot open viewer: the plot file is no longer available."
+        ).send()
+        return
+
+    # A "channel plot" is the one case where per-channel scrolling is expected;
+    # heatmaps/networks legitimately use the pan/zoom static image view.
+    is_channel_plot = "channel" in str(plot_title).lower()
+
+    # ── 1. Native PyQt5 viewer (primary) ──────────────────────────────────
+    launch = None
+    try:
+        from fc_pipeline.viz.viewer_launcher import launch_eeg_viewer
+        raw_data_path = payload.get("raw_data_path", "")
+        preprocessed_data_path = payload.get("preprocessed_data_path", "")
+        target_data = (
+            preprocessed_data_path
+            if "after" in str(plot_title).lower() and preprocessed_data_path
+            else raw_data_path
+        )
+        if not target_data:
+            target_data = cl.user_session.get("data_path")
+
+        launch = await launch_eeg_viewer(
+            plot_path=plot_path,
+            title=plot_title,
+            data_path=target_data,
+        )
+        logger.info(
+            "PyQt5 desktop viewer launch for %s: mode=%s n_channels=%s data_type=%s reason=%s log=%s",
+            plot_path, launch.mode, launch.n_channels, launch.data_type,
+            launch.reason, launch.log_path,
+        )
+    except Exception as exc:
+        logger.exception("Desktop PyQt5 viewer launch raised: %s", exc)
+
+    # ── 2. Browser-based viewer (Plotly in sidebar, secondary) ────────────
+    browser_opened = False
+    try:
+        from fc_pipeline.viz.browser_viewer import build_plotly_figure
+        fig = build_plotly_figure(image_path=plot_path, title=plot_title)
+        viewer_element = cl.Plotly(
+            name=f"eeg_viewer_{Path(plot_path).stem}",
+            figure=fig,
+            display="side",
+            size="large",
+        )
+        await cl.ElementSidebar.set_elements([viewer_element], key=f"eeg_viewer:{plot_path}")
+        await cl.ElementSidebar.set_title(f"🔍 {plot_title}")
+        browser_opened = True
+    except Exception as exc:
+        logger.warning("Browser Plotly viewer failed for %s: %s; falling back to static image", plot_path, exc)
+        try:
+            viewer_element = cl.Image(
+                name=f"eeg_viewer_{Path(plot_path).stem}",
+                path=str(plot_path),
+                display="side",
+                size="large",
+            )
+            await cl.ElementSidebar.set_elements([viewer_element], key=f"eeg_viewer:{plot_path}")
+            await cl.ElementSidebar.set_title(f"🔍 {plot_title}")
+            browser_opened = True
+        except Exception:
+            pass
+
+    # ── 3. Honest status notification ─────────────────────────────────────
+    status_lines: list[str] = []
+    if launch is None:
+        status_lines.append(f"⚠️ **Viewer could not be launched** for *{plot_title}*.")
+    elif not launch.ok:
+        status_lines.append(
+            f"⚠️ **Native EEG viewer could not start** for *{plot_title}*.\n"
+            f"- Reason: {launch.reason or 'unknown'}"
+        )
+    elif launch.mode == "interactive":
+        src = launch.data_type or "EEG"
+        status_lines.append(
+            f"🖥️ **Native interactive EEG viewer opened** for *{plot_title}*\n"
+            f"- {launch.n_channels} channels loaded from {src} data — scrolling shows **all** of them.\n"
+            "- 🖱 **Mouse wheel** → scroll one channel at a time\n"
+            "- ⬆/⬇ **Prev/Next Channels** buttons (or PageUp/PageDown) → full page\n"
+            "- **Right scrollbar** → drag the thumb to jump anywhere\n"
+            "- Shift+Wheel / ← → → slide time  |  Zoom +/− → amplitude gain"
+        )
+    else:  # mode == "static"
+        if is_channel_plot:
+            status_lines.append(
+                f"⚠️ **Channel scrolling is NOT available for *{plot_title}*** — the desktop "
+                "window opened as a **static pan/zoom image** rather than the interactive "
+                "channel viewer.\n"
+                f"- Reason: {launch.reason or 'EEG data could not be resolved/loaded'}\n"
+                "- The in-browser viewer on the right still allows zoom/pan."
+            )
+        else:
+            status_lines.append(
+                f"🖼 **Image viewer opened** for *{plot_title}* (static pan/zoom — this plot "
+                "has no per-channel data to scroll)."
+            )
+        if launch.log_path:
+            status_lines.append(f"- Diagnostics: `{launch.log_path}`")
+
+    if browser_opened and not (launch and launch.mode == "interactive"):
+        status_lines.append(
+            "\n**In-Browser Controls (Right Panel):**\n"
+            "- 🖱 **Scroll wheel** → Zoom in / out\n"
+            "- 🖱 **Click & Drag** → Pan / slide across the image\n"
+            "- 🔄 **Double-click** → Reset view to fit"
+        )
+
+    await cl.Message(content="\n".join(status_lines)).send()
+
+
+
 @cl.action_callback("new_query_button")
 async def _on_new_query_button(action: cl.Action):
     """Explicit unlock: the ONLY way a completed run is discarded for a fresh analysis."""
@@ -2799,10 +3015,25 @@ async def _handle_pipeline_output(
                                 name=plot_name,
                                 display="inline",
                             )
+                            # Interactive viewer action button (requires PyQt5)
+                            _raw_p = str(final_state.get("raw_data_path") or output_state.get("raw_data_path") or cl.user_session.get("data_path") or "")
+                            _prep_p = str(dp_output or "")
+                            _viewer_action = cl.Action(
+                                name="open_eeg_viewer",
+                                payload={
+                                    "path": str(plot_path),
+                                    "title": plot_name.replace('_', ' ').title(),
+                                    "raw_data_path": _raw_p,
+                                    "preprocessed_data_path": _prep_p,
+                                },
+                                label="🔍 Open Interactive Viewer",
+                                description="Open in a desktop window with zoom, slide, and pan controls.",
+                            )
                             try:
                                 await cl.Message(
                                     content=f"### {plot_name.replace('_', ' ').title()}",
                                     elements=[image],
+                                    actions=[_viewer_action],
                                 ).send()
                             except (GeneratorExit, RuntimeError, Exception) as e:
                                 logger.warning(
@@ -2938,11 +3169,20 @@ async def _handle_pipeline_output(
                         for metric_name, h_path in ordered_heatmaps:
                             if Path(h_path).exists():
                                 img = cl.Image(path=h_path, name=f"heatmap_{metric_name}", display="inline")
+                                _h_viewer_action = cl.Action(
+                                    name="open_eeg_viewer",
+                                    payload={"path": str(h_path), "title": f"{metric_label(metric_name)} Heatmap"},
+                                    label="🔍 Interactive Zoom & Slide",
+                                    description="Open interactive viewer with zoom, pan, and slide controls.",
+                                )
                                 try:
                                     await cl.Message(
                                         content=f"#### 🌡️ {metric_label(metric_name)} Heatmap",
                                         elements=[img],
-                                        actions=[_preview_action(h_path, label=f"👁️ Open {metric_label(metric_name)} heatmap in panel")],
+                                        actions=[
+                                            _h_viewer_action,
+                                            _preview_action(h_path, label=f"👁️ Open in side panel"),
+                                        ],
                                     ).send()
                                 except (GeneratorExit, RuntimeError, Exception) as e:
                                     logger.warning("Failed to inline heatmap %r: %s", metric_name, e)
@@ -2969,10 +3209,20 @@ async def _handle_pipeline_output(
                                     n_path = conn_networks[metric_name]
                                     if Path(n_path).exists():
                                         img = cl.Image(path=n_path, name=f"network_{metric_name}", display="inline")
+                                        _n_viewer_action = cl.Action(
+                                            name="open_eeg_viewer",
+                                            payload={"path": str(n_path), "title": f"{metric_label(metric_name)} Network Graph"},
+                                            label="🔍 Interactive Zoom & Slide",
+                                            description="Open interactive viewer with zoom, pan, and slide controls.",
+                                        )
                                         try:
                                             await cl.Message(
                                                 content=f"#### 🕸️ {metric_label(metric_name)} Network Graph",
                                                 elements=[img],
+                                                actions=[
+                                                    _n_viewer_action,
+                                                    _preview_action(n_path, label="👁️ Open in side panel"),
+                                                ],
                                             ).send()
                                         except (GeneratorExit, RuntimeError, Exception) as e:
                                             logger.warning("Failed to inline network graph %r: %s", metric_name, e)

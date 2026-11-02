@@ -30,6 +30,20 @@ _BROWSER_WINDOW_SECONDS = 10.0
 _MAX_EPOCHS_SHOWN = 10
 _MAX_CHANNELS_SHOWN = 20
 
+# --- Light theme palette for the channel time-series figures -----------------
+# Traces keep their original colour identity (teal = normal, orange = plan,
+# red = flagged/boundary) but in shades that stay legible on a white background.
+_BG = "#ffffff"        # figure / axes background
+_FG = "#1a1a1a"        # titles
+_TICK = "#555555"      # axis labels & ticks
+_AXIS = "#999999"      # last-row spine
+_ZERO = "#cccccc"      # zero-reference line
+_TRACE = "#0e7c86"     # normal trace (dark teal)
+_TRACE_PLAN = "#b9770e"  # plan-selected channel (dark amber)
+_TRACE_BAD = "#c0392b"   # flagged / flatline channel (dark red)
+_LABEL = "#3a3a3a"     # channel label text
+_BOUNDARY = "#c0392b"  # epoch boundary dashes
+
 
 def _eeg_scaling(channel_data: np.ndarray) -> float:
     """Explicit trace scaling (volts) for MNE's browser, from the data itself.
@@ -52,13 +66,12 @@ def plot_channels_before(
     flagged_channels: Sequence[str],
     output_dir: Path,
 ) -> Optional[str]:
-    """Render the selected channels as they were recorded (MNE ``Raw.plot``).
+    """Render ALL EEG channels before preprocessing as a stacked matplotlib figure.
 
-    Shows the unfiltered, unreferenced signal of the analysis channels in a
-    window that starts at the first event of the requested condition.
-    Channels flagged as flatline are drawn in the MNE "bad" colour.
-
-    Only a short snippet is copied, so the full recording is never duplicated.
+    Every channel gets its own row so the PNG is self-contained and shows
+    the full montage without any scrollbar.  The snippet is centred on the
+    first annotation of the requested condition (or the recording start).
+    Flagged flatline channels are drawn in red; plan-selected channels in gold.
     Plot failures never abort Data Prep: returns ``None`` after logging.
     """
     try:
@@ -67,11 +80,18 @@ def plot_channels_before(
         path = build_safe_output_path(output_dir, params.run_id, "channels_before", ".png")
 
         sfreq = float(raw.info["sfreq"])
-        picks = [raw.ch_names.index(ch) for ch in params.channels if ch in raw.ch_names]
+        all_eeg = mne.pick_types(raw.info, eeg=True)
+        if len(all_eeg) > 0:
+            picks = list(all_eeg)
+        else:
+            picks = (
+                [raw.ch_names.index(ch) for ch in params.channels if ch in raw.ch_names]
+                or list(range(len(raw.ch_names)))
+            )
         if not picks:
             return None
 
-        # Window start: first event of the condition (fall back to recording start)
+        # Window: start at first condition event (or recording start)
         start_sample = 0
         try:
             events, event_id = mne.events_from_annotations(raw, verbose=False)
@@ -85,36 +105,89 @@ def plot_channels_before(
         if n_window < 2:
             start_sample, n_window = 0, int(min(_BROWSER_WINDOW_SECONDS * sfreq, raw.n_times))
 
-        snippet = raw.get_data(picks=picks, start=start_sample, stop=start_sample + n_window)
-        info = mne.pick_info(raw.info, picks, copy=True)
-        info["bads"] = [ch for ch in info["ch_names"] if ch in set(flagged_channels)]
-        view = mne.io.RawArray(snippet, info, verbose=False)
-        good_rows = [i for i, ch in enumerate(info["ch_names"]) if ch not in info["bads"]]
-        scaling = _eeg_scaling(snippet[good_rows])
+        data = raw.get_data(picks=picks, start=start_sample, stop=start_sample + n_window)
+        ch_names = [raw.ch_names[i] for i in picks]
+        t_axis = np.linspace(0.0, n_window / sfreq, n_window)
 
-        with mne.viz.use_browser_backend("matplotlib"):
-            fig = view.plot(
-                duration=n_window / sfreq,
-                n_channels=min(len(picks), _MAX_CHANNELS_SHOWN),
-                scalings={"eeg": scaling},
-                show=False,
-                block=False,
-                title=f"Before Data Prep - {params.condition} (first {n_window / sfreq:.1f} s, "
-                f"unfiltered, unreferenced)",
-            )
-            fig.mne.ax_main.set_title(
-                f"Before Data Prep - {params.condition}: first {n_window / sfreq:.1f} s, "
-                "unfiltered, unreferenced (flagged channels greyed)",
-                fontsize=9,
-            )
-            fig.savefig(str(path), dpi=150, bbox_inches="tight")
-            plt.close(fig)
+        flagged_set = set(flagged_channels)
+        plan_set = set(params.channels)
 
-        logger.info("Channels-before plot saved: %s", path.name)
+        n_ch = len(ch_names)
+        # Cap total figure height so it fits in a browser viewport without scrolling.
+        # 9 inches at 130 DPI ≈ 1170 pixels (fits any 1080p+ screen).
+        _MAX_FIG_H = 9.0
+        row_h = (_MAX_FIG_H - 1.4) / max(n_ch, 1)
+        fig_h = _MAX_FIG_H
+        lbl_fs = max(4.5, min(8.0, row_h * 52))  # font size scales with row height
+
+        # --- light-themed figure ---
+        fig, axes = plt.subplots(
+            n_ch, 1,
+            figsize=(16, fig_h),
+            sharex=True,
+            facecolor=_BG,
+        )
+        if n_ch == 1:
+            axes = [axes]
+
+        # global amplitude scale: 3× peak std across all good channels
+        good_mask = np.array([ch not in flagged_set for ch in ch_names])
+        good_data = data[good_mask] if good_mask.any() else data
+        peak_std = float(np.max(np.std(good_data, axis=1))) if good_data.size else 20e-6
+        amp = 3.0 * peak_std if peak_std > 0 else 20e-6
+
+        for i, (ax, ch, trace) in enumerate(zip(axes, ch_names, data)):
+            ax.set_facecolor(_BG)
+            ax.set_xlim(t_axis[0], t_axis[-1])
+            ax.set_ylim(-amp, amp)
+            ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
+            ax.spines[:].set_visible(False)
+
+            is_bad = ch in flagged_set
+            is_plan = ch in plan_set
+
+            if is_bad:
+                color, lw, lbl_color = _TRACE_BAD, 0.7, _TRACE_BAD
+                label = f"{ch} ✕"
+            elif is_plan:
+                color, lw, lbl_color = _TRACE_PLAN, 0.9, _TRACE_PLAN
+                label = f"★ {ch}"
+            else:
+                color, lw, lbl_color = _TRACE, 0.7, _LABEL
+                label = ch
+
+            ax.plot(t_axis, trace, color=color, linewidth=lw, rasterized=True)
+            ax.axhline(0, color=_ZERO, linewidth=0.4, zorder=0)
+            ax.text(
+                -0.01, 0.5, label,
+                transform=ax.transAxes,
+                ha="right", va="center",
+                fontsize=6.5, color=lbl_color,
+                fontfamily="monospace",
+            )
+
+        # x-axis on the last row only
+        axes[-1].tick_params(bottom=True, labelbottom=True, colors=_TICK)
+        axes[-1].set_xlabel("Time (s)", color=_TICK, fontsize=8)
+        axes[-1].spines["bottom"].set_visible(True)
+        axes[-1].spines["bottom"].set_color(_AXIS)
+
+        fig.suptitle(
+            f"Channels Before — {params.condition}: first {n_window / sfreq:.1f} s, "
+            f"unfiltered, unreferenced  ★=plan  ✕=flagline",
+            color=_FG, fontsize=9, y=1.0,
+        )
+        fig.tight_layout(h_pad=0.0)
+        fig.savefig(str(path), dpi=130, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        logger.info("Channels-before plot saved: %s (%d channels)", path.name, n_ch)
         return str(path)
     except Exception as exc:
         logger.warning("Channels-before plot failed: %s: %s", type(exc).__name__, exc)
         return None
+
 
 
 def plot_channels_after(
@@ -122,10 +195,12 @@ def plot_channels_after(
     params: ValidatedDataPrepParams,
     output_dir: Path,
 ) -> Optional[str]:
-    """Render the final epochs with MNE's ``Epochs.plot`` (matplotlib backend).
+    """Render ALL preprocessed channels as a stacked matplotlib figure.
 
-    Shows the first few epochs of the filtered, referenced analysis channels
-    exactly as they are handed to the connectivity stage.
+    Every channel gets its own row so the PNG is self-contained and shows
+    the complete filtered/referenced montage without any scrollbar.
+    Plan-selected channels are highlighted in gold.  Concatenates the first
+    few epochs along the time axis for a compact but meaningful view.
     Plot failures never abort Data Prep: returns ``None`` after logging.
     """
     try:
@@ -133,34 +208,100 @@ def plot_channels_after(
         output_dir.mkdir(parents=True, exist_ok=True)
         path = build_safe_output_path(output_dir, params.run_id, "channels_after", ".png")
 
-        epoch_data = epochs.get_data()  # (n_epochs, n_channels, n_times)
-        scaling = _eeg_scaling(
-            epoch_data.transpose(1, 0, 2).reshape(epoch_data.shape[1], -1)
+        n_show_epochs = min(len(epochs), _MAX_EPOCHS_SHOWN)
+        ep_data = epochs[:n_show_epochs].get_data()  # (n_ep, n_ch, n_t)
+        n_ep, n_ch, n_t = ep_data.shape
+        sfreq = float(epochs.info["sfreq"])
+        ep_dur = n_t / sfreq
+
+        # Concatenate epochs along time with a small NaN gap so epoch
+        # boundaries are visible as breaks in the line.
+        gap_samples = max(1, int(0.02 * sfreq))
+        gap = np.full((n_ch, gap_samples), np.nan)
+        parts = []
+        for e in range(n_ep):
+            parts.append(ep_data[e])  # (n_ch, n_t)
+            if e < n_ep - 1:
+                parts.append(gap)
+        data = np.concatenate(parts, axis=1)  # (n_ch, total_samples)
+        total_t = data.shape[1] / sfreq
+        t_axis = np.linspace(0.0, total_t, data.shape[1])
+
+        ch_names = list(epochs.ch_names)
+        plan_set = set(params.channels)
+
+        # Global amplitude scale (ignoring NaN gaps)
+        finite = data[np.isfinite(data).all(axis=1)]
+        peak_std = float(np.nanmax(np.nanstd(finite, axis=1))) if finite.size else 20e-6
+        amp = 3.0 * peak_std if peak_std > 0 else 20e-6
+
+        n_ch = len(ch_names)
+        # Cap total figure height so it always fits in a browser viewport.
+        _MAX_FIG_H = 9.0
+        row_h = (_MAX_FIG_H - 1.4) / max(n_ch, 1)
+        fig_h = _MAX_FIG_H
+        lbl_fs = max(4.5, min(8.0, row_h * 52))
+
+        fig, axes = plt.subplots(
+            n_ch, 1,
+            figsize=(16, fig_h),
+            sharex=True,
+            facecolor=_BG,
         )
+        if n_ch == 1:
+            axes = [axes]
 
-        with mne.viz.use_browser_backend("matplotlib"):
-            fig = epochs.plot(
-                n_epochs=min(len(epochs), _MAX_EPOCHS_SHOWN),
-                n_channels=min(len(epochs.ch_names), _MAX_CHANNELS_SHOWN),
-                scalings={"eeg": scaling},
-                show=False,
-                block=False,
-                title=f"After Data Prep - {params.condition} "
-                f"({len(epochs)} epochs, {params.fmin:g}-{params.fmax:g} Hz, referenced)",
-            )
-            fig.mne.ax_main.set_title(
-                f"After Data Prep - {params.condition}: {len(epochs)} epochs, "
-                f"{params.fmin:g}-{params.fmax:g} Hz, average-referenced",
-                fontsize=9,
-            )
-            fig.savefig(str(path), dpi=150, bbox_inches="tight")
-            plt.close(fig)
+        for i, (ax, ch, trace) in enumerate(zip(axes, ch_names, data)):
+            ax.set_facecolor(_BG)
+            ax.set_xlim(t_axis[0], t_axis[-1])
+            ax.set_ylim(-amp, amp)
+            ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
+            ax.spines[:].set_visible(False)
 
-        logger.info("Channels-after plot saved: %s", path.name)
+            is_plan = ch in plan_set
+            color = _TRACE_PLAN if is_plan else _TRACE
+            lw = 0.9 if is_plan else 0.7
+            lbl_color = _TRACE_PLAN if is_plan else _LABEL
+            label = f"\u2605 {ch}" if is_plan else ch
+
+            ax.plot(t_axis, trace, color=color, linewidth=lw, rasterized=True)
+            ax.axhline(0, color=_ZERO, linewidth=0.4, zorder=0)
+            ax.text(
+                -0.01, 0.5, label,
+                transform=ax.transAxes,
+                ha="right", va="center",
+                fontsize=6.5, color=lbl_color,
+                fontfamily="monospace",
+            )
+
+            # epoch boundary markers
+            for e in range(1, n_ep):
+                x_boundary = e * (ep_dur + gap_samples / sfreq)
+                ax.axvline(x_boundary, color=_BOUNDARY, linewidth=0.5,
+                           linestyle="--", alpha=0.5, zorder=1)
+
+        axes[-1].tick_params(bottom=True, labelbottom=True, colors=_TICK)
+        axes[-1].set_xlabel("Time (s)", color=_TICK, fontsize=8)
+        axes[-1].spines["bottom"].set_visible(True)
+        axes[-1].spines["bottom"].set_color(_AXIS)
+
+        fig.suptitle(
+            f"Channels After — {params.condition}: {n_show_epochs} epochs, "
+            f"{params.fmin:g}\u2013{params.fmax:g} Hz, average-ref  "
+            f"\u2605=plan  red dashes=epoch boundaries",
+            color=_FG, fontsize=9, y=1.0,
+        )
+        fig.tight_layout(h_pad=0.0)
+        fig.savefig(str(path), dpi=130, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+        logger.info("Channels-after plot saved: %s (%d channels)", path.name, n_ch)
         return str(path)
     except Exception as exc:
         logger.warning("Channels-after plot failed: %s: %s", type(exc).__name__, exc)
         return None
+
 
 
 def generate_diagnostics(

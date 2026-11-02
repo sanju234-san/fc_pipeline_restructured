@@ -6,3 +6,10 @@
 ddgs>=9.0
 deepagents>=0.7
 dspy>=3.0
+
+# GRPO fine-tuning (research/grpo_trainer.py)
+# Trains a local model offline using Group Relative Policy Optimization on
+# synthetic EEG scenarios. Not needed for the live pipeline.
+trl>=0.8
+transformers>=4.40
+datasets>=2.18

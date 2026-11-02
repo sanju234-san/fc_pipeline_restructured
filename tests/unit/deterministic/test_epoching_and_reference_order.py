@@ -336,12 +336,29 @@ def test_before_and_after_channel_plots_are_produced(synthetic_eeg_path, tmp_pat
 
 
 def test_plot_failure_never_aborts_data_prep(synthetic_eeg_path, tmp_path, monkeypatch):
+    """A crash inside the channel plot helpers must not abort the whole pipeline."""
     from fc_pipeline.deterministic.data_prep import plotting
 
     def boom(*args, **kwargs):
-        raise RuntimeError("browser backend unavailable")
+        raise RuntimeError("matplotlib backend unavailable")
 
-    monkeypatch.setattr(plotting.mne.viz, "use_browser_backend", boom)
+    # The new pure-matplotlib code calls plt.subplots for channels_before and
+    # channels_after.  Patching it causes those two helpers to fail gracefully
+    # and return None, while channel_variance (which also uses plt.subplots but
+    # is called after them in generate_diagnostics) should survive because each
+    # helper wraps its own try/except.  We only want the before/after to fail.
+    # Patch plotting.plt.subplots to raise only for the first two calls, then
+    # delegate to the real implementation for subsequent ones.
+    original_subplots = plotting.plt.subplots
+    call_count = {"n": 0}
+
+    def selective_boom(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:  # channels_before and channels_after
+            raise RuntimeError("matplotlib backend unavailable")
+        return original_subplots(*args, **kwargs)
+
+    monkeypatch.setattr(plotting.plt, "subplots", selective_boom)
     result = run_data_prep(
         _executor_input(synthetic_eeg_path),
         output_dir=tmp_path / "out",

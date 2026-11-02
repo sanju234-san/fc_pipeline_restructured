@@ -14,3 +14,12 @@ pytest>=7.4.0
 pytest-asyncio>=0.23.0
 nemoguardrails>=0.24.0
 deepagents>=0.7.0
+
+# Optional: interactive EEG viewer (viz/eeg_viewer.py)
+# Install to enable the 'Open Interactive Viewer' button in the Chainlit UI:
+#   pip install PyQt5>=5.15
+PyQt5>=5.15
+plotly>=5.0.0
+
+mne
+mne-connectivity
