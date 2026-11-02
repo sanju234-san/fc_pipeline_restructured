@@ -117,6 +117,12 @@ def build_run_context(
     raw_data_path: Optional[str] = None,
     channel_plot_paths: Optional[Mapping[str, Any]] = None,
     bad_channels_dropped: Optional[List[str]] = None,
+    metric_csv_paths: Optional[Mapping[str, Any]] = None,
+    heatmap_image_paths: Optional[Mapping[str, Any]] = None,
+    network_image_paths: Optional[Mapping[str, Any]] = None,
+    numerical_summaries: Optional[Mapping[str, Any]] = None,
+    evidence_summary: Optional[List[Any]] = None,
+    consolidated_report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the JSON-serialisable run context from the pieces of a finished run."""
     manifest_rows = []
@@ -130,6 +136,18 @@ def build_run_context(
                 "risk_tier": _jsonable(_get(entry, "risk_tier")),
             }
         )
+
+    connectivity_data = None
+    if metric_csv_paths or heatmap_image_paths or numerical_summaries or evidence_summary or consolidated_report_path:
+        connectivity_data = {
+            "metric_csv_paths": _jsonable(dict(metric_csv_paths or {})),
+            "heatmap_image_paths": _jsonable(dict(heatmap_image_paths or {})),
+            "network_image_paths": _jsonable(dict(network_image_paths or {})),
+            "numerical_summaries": _jsonable(dict(numerical_summaries or {})),
+            "evidence_summary": _jsonable(list(evidence_summary or [])),
+            "consolidated_report_path": _jsonable(consolidated_report_path),
+        }
+
     return {
         "schema_version": RUN_CONTEXT_SCHEMA_VERSION,
         "run_id": run_id,
@@ -141,8 +159,7 @@ def build_run_context(
         "bad_channels_dropped": list(bad_channels_dropped or []),
         "channel_plot_paths": _jsonable(dict(channel_plot_paths or {})),
         "parameter_manifest": manifest_rows,
-        # Filled in by the Connectivity stage once it exists.
-        "connectivity": None,
+        "connectivity": connectivity_data,
     }
 
 
@@ -157,6 +174,12 @@ def build_run_context_from_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         raw_data_path=state.get("raw_data_path"),
         channel_plot_paths=state.get("channel_plot_paths"),
         bad_channels_dropped=state.get("bad_channels_dropped"),
+        metric_csv_paths=state.get("metric_csv_paths"),
+        heatmap_image_paths=state.get("heatmap_image_paths"),
+        network_image_paths=state.get("network_image_paths"),
+        numerical_summaries=state.get("numerical_summaries"),
+        evidence_summary=state.get("evidence_summary"),
+        consolidated_report_path=state.get("consolidated_report_path"),
     )
 
 

@@ -29,7 +29,8 @@ _EEG_VOCAB = re.compile(
     r"\b("
     r"eeg|electrode|electrodes|channel|channels|connectivity|coherence|"
     r"plv|pli|wpli|imcoh|alpha|beta|theta|delta|gamma|"
-    r"epoch|epochs|frontal|parietal|occipital"
+    r"epoch|epochs|frontal|parietal|occipital|temporal|central|"
+    r"band|bands|frequency|freq|psd|plot|plots|condition|reference|filter|preprocessing"
     r")\b",
     re.IGNORECASE,
 )

@@ -902,22 +902,9 @@ def _build_graph_state(
         "evaluation_summary_csv_path": None,
         "final_report_path": None,
     }
-    # M5 auto-memory: if this user has CONFIRMED defaults for the 3 scientific
-    # axes (frequency band / channels / condition) or reference, pre-populate
-    # them so the Supervisor skips the corresponding HITL clarification.
-    try:
-        from fc_pipeline.pipeline.user_memory import (
-            apply_confirmed_defaults_to_state,
-            load_preference_store,
-        )
-        store = load_preference_store()
-        defaults_applied = apply_confirmed_defaults_to_state(base, store=store)
-        if defaults_applied:
-            base.update(defaults_applied)
-            cl.user_session.set("m5_defaults_applied", list(defaults_applied.keys()))
-    except Exception as exc:  # pragma: no cover - never block startup on memory failure
-        logger.warning("M5: could not pre-populate defaults (continuing without): %s: %s", type(exc).__name__, exc)
-        cl.user_session.set("m5_defaults_applied", [])
+    # Per Requirement 7: persistent user preferences remain separate from active analysis state
+    # and must NEVER silently pre-populate or override unresolved scientific axes on a dataset.
+    cl.user_session.set("m5_defaults_applied", [])
     return base  # type: ignore[return-value]
 
 
@@ -1231,6 +1218,22 @@ async def on_message(message: cl.Message):
             await _resume_clarification(pending_run_id, user_text, accumulated_query or "")
             return
         cl.user_session.set("pending_clarification_run_id", None)
+
+    # Guard against accidental typing restarting the pipeline while paused at Gate 1 review
+    pending_gate_1_run = cl.user_session.get("pending_gate_1_run_id")
+    if pending_gate_1_run and not is_explicit_new:
+        pipeline_app = cl.user_session.get("graph")
+        snap = pipeline_app.get_state({"configurable": {"thread_id": pending_gate_1_run}}) if pipeline_app else None
+        if snap is not None and snap.next and "gate_1_review" in snap.next:
+            await cl.Message(
+                content=(
+                    "⚠️ **Gate 1 Review is pending.**\n\n"
+                    "Please use the buttons on the review card above (**Approve**, **Reject**, "
+                    "**Request Changes**, or **Edit**) to make your decision, or type `/reset` to start fresh."
+                )
+            ).send()
+            return
+        cl.user_session.set("pending_gate_1_run_id", None)
 
     # --- Handle transformer-clarification confirmation flow ---
     if awaiting_transformer_clarification:
@@ -1647,6 +1650,27 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
     if not state:
         return False
 
+    # --- Guardrail input screening for follow-up questions ---
+    try:
+        from fc_pipeline.pipeline.nodes import _screen_with_rails_async
+        from fc_pipeline.agentic.supervisor.action_policy import DecisionType
+
+        decision = await _screen_with_rails_async("input", text, run_id=state.get("run_id"))
+        if decision is not None and decision.behavior in (DecisionType.DENY, DecisionType.ASK_HUMAN):
+            rail_status = (decision.decision_context or {}).get("details", {}).get("rail_status")
+            if rail_status == "blocked" or decision.behavior == DecisionType.DENY:
+                reason = decision.reason or "The input guardrail flagged this message as a possible jailbreak / prompt-injection attempt, or as unrelated to EEG analysis."
+                await cl.Message(
+                    content=(
+                        f"🛡️ **Guardrail: Cannot process this query.**\n\n"
+                        f"{reason}\n\n"
+                        f"_If you want to start a new EEG analysis, press the **🆕 New query** button._"
+                    )
+                ).send()
+                return True
+    except Exception as exc:
+        logger.warning("Follow-up input guardrail check failed: %s: %s", type(exc).__name__, exc)
+
     # --- (1) Grab / lazily initialise the Deep Agents context window manager
     manager: Optional[PostRunContextWindowManager] = cl.user_session.get("deepagents_followup_manager")
     if manager is None:
@@ -1797,6 +1821,127 @@ async def _offer_new_query_action() -> None:
             ),
         ],
     ).send()
+
+
+# ── Right-hand file preview panel (Chainlit ElementSidebar) ─────────────────────
+# One panel, always the same: opening another file REPLACES its contents.
+# These helpers/callbacks are UI-only: they never touch the LangGraph app, HITL
+# gates, checkpointer, memory or user-session analysis state, and never start
+# an analysis.
+_PREVIEW_MAX_ROWS = 5000
+_PREVIEW_MAX_TEXT_CHARS = 400_000
+_PREVIEW_CSV = {".csv", ".tsv"}
+_PREVIEW_MARKDOWN = {".md", ".markdown"}
+_PREVIEW_TEXT = {".txt", ".log", ".json", ".yaml", ".yml", ".toml"}
+_PREVIEW_IMAGE = {".png", ".jpg", ".jpeg"}
+_PREVIEW_PDF = {".pdf"}
+
+
+def _safe_preview_path(raw_path: Any) -> Optional[Path]:
+    """Resolve a previewable file; only files under the project's outputs/ dir are allowed."""
+    try:
+        p = Path(str(raw_path)).resolve()
+        root = Path("outputs").resolve()
+    except Exception:
+        return None
+    if not p.is_file():
+        return None
+    try:
+        p.relative_to(root)
+    except ValueError:
+        return None
+    return p
+
+
+def _preview_action(path: Any, label: Optional[str] = None) -> cl.Action:
+    """Build a 'Preview' action for a generated file (opens the right-hand panel)."""
+    name = Path(str(path)).name
+    return cl.Action(
+        name="preview_file",
+        payload={"path": str(path)},
+        label=label or f"👁️ Preview {name}",
+        description=f"Open {name} in the right-hand preview panel.",
+    )
+
+
+def _close_preview_action() -> cl.Action:
+    return cl.Action(
+        name="close_file_preview",
+        payload={"value": "close"},
+        label="✖ Close preview",
+        description="Close the right-hand preview panel.",
+    )
+
+
+def _build_preview_elements(path: Path) -> tuple[list, str]:
+    """Return (sidebar elements, note) holding the file's ACTUAL contents."""
+    ext = path.suffix.lower()
+    name = path.name
+    note = ""
+    if ext in _PREVIEW_CSV:
+        import pandas as pd
+
+        sep = "\t" if ext == ".tsv" else ","
+        df = pd.read_csv(path, sep=sep, nrows=_PREVIEW_MAX_ROWS)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            total = max(sum(1 for _ in fh) - 1, 0)
+        note = f"{len(df)} of {total} rows × {len(df.columns)} columns"
+        return [cl.Dataframe(data=df, name=name, display="side", size="large")], note
+    if ext in _PREVIEW_MARKDOWN:
+        text = path.read_text(encoding="utf-8", errors="replace")[:_PREVIEW_MAX_TEXT_CHARS]
+        return [cl.Text(name=name, content=text, display="side")], note
+    if ext in _PREVIEW_TEXT:
+        text = path.read_text(encoding="utf-8", errors="replace")[:_PREVIEW_MAX_TEXT_CHARS]
+        lang = "json" if ext == ".json" else None
+        return [cl.Text(name=name, content=text, language=lang, display="side")], note
+    if ext in _PREVIEW_IMAGE:
+        return [cl.Image(name=name, path=str(path), display="side", size="large")], note
+    if ext in _PREVIEW_PDF:
+        return [cl.Pdf(name=name, path=str(path), display="side")], note
+    return [], "no preview available"
+
+
+@cl.action_callback("preview_file")
+async def _on_preview_file(action: cl.Action):
+    """Show the selected file's real contents in the single right-hand panel."""
+    path = _safe_preview_path((action.payload or {}).get("path"))
+    if path is None:
+        await cl.Message(content="⚠️ That file is no longer available for preview.").send()
+        return
+    try:
+        elements, note = _build_preview_elements(path)
+        download = cl.File(path=str(path), name=path.name, display="side")
+        if not elements:
+            elements = [
+                cl.Text(
+                    name=f"{path.name} (no preview)",
+                    content=(
+                        f"**Preview is not available for `{path.suffix or 'this'}` files.**\n\n"
+                        "Use the download link below to open the file."
+                    ),
+                    display="side",
+                )
+            ]
+        title = f"{path.name} — {note}" if note else path.name
+        # Same panel for every file: a new key replaces the contents in place.
+        await cl.ElementSidebar.set_elements(
+            elements + [download], key=f"preview:{path}:{path.stat().st_mtime_ns}"
+        )
+        await cl.ElementSidebar.set_title(title)
+    except Exception as e:
+        logger.warning("Failed to open file preview for %s: %s", path.name, e)
+        await cl.Message(
+            content=f"⚠️ Preview unavailable for `{path.name}` ({type(e).__name__}). It can still be downloaded."
+        ).send()
+
+
+@cl.action_callback("close_file_preview")
+async def _on_close_file_preview(action: cl.Action):
+    """Close the right-hand preview panel (UI only)."""
+    try:
+        await cl.ElementSidebar.set_elements([])
+    except Exception as e:
+        logger.warning("Failed to close file preview: %s", e)
 
 
 @cl.action_callback("new_query_button")
@@ -2366,7 +2511,10 @@ async def _present_clarification(
         reply = str((payload or {}).get("value", "")).strip()
 
     if reply:
-        await _resume_clarification(run_id, reply, accumulated_query)
+        if cl.user_session.get("pending_clarification_run_id") == run_id:
+            await _resume_clarification(run_id, reply, accumulated_query)
+        else:
+            logger.info("Clarification for %s already resumed or superseded.", run_id)
 
 
 async def _handle_pipeline_output(
@@ -2434,6 +2582,7 @@ async def _handle_pipeline_output(
 
     if "gate_1_review" in routed_node:
         cl.user_session.set("awaiting_clarification", False)
+        cl.user_session.set("pending_gate_1_run_id", run_id)
 
         # Generalized gate: a NeMo rail pause carries a decision_context and is
         # presented through the same AskActionMessage/resume mechanics.
@@ -2448,24 +2597,18 @@ async def _handle_pipeline_output(
         while True:
             # Regenerate the Markdown artifact on every Gate 1 render so any
             # human edits are reflected in the openable document.
+            plan_file = None
             try:
                 plan_md_path = write_analysis_plan_markdown(plan, manifest, run_id)
-                plan_text = cl.Text(
-                    name="analysis_plan.md",
-                    content=plan_md_path.read_text(encoding="utf-8"),
-                    display="side",
-                )
                 plan_file = cl.File(name="analysis_plan.md", path=str(plan_md_path), display="inline")
-                await cl.Message(
-                    content="### 📄 Analysis Plan\nOpen the generated Markdown document to review the exact Supervisor plan and manifest.",
-                    elements=[plan_text, plan_file],
-                ).send()
             except Exception as exc:
                 logger.warning("Could not create plan Markdown artifact: %s", exc)
 
-            # (Re-)build and render the Gate 1 card (reflects edits made on
-            # prior iterations via the manifest closure reference).
+            # (Re-)build and render the Gate 1 card with downloadable artifact attached
             msg.content = _build_gate_1_card(run_id, summary_text, plan, manifest, routed_node)
+            if plan_file:
+                msg.elements = [plan_file]
+                msg.actions = [_preview_action(plan_md_path, label="👁️ Preview analysis plan")]
             await msg.update()
 
             # Build combined action list (edit buttons + Approve/Request Changes/Reject)
@@ -2481,6 +2624,7 @@ async def _handle_pipeline_output(
                 # Strictly aborted on timeout or session drop — never auto-approve
                 _reset_conversation_state()
                 cl.user_session.set("gate_1_approved", False)
+                cl.user_session.set("pending_gate_1_run_id", None)
                 await cl.Message(
                     content="⚠️ **Gate 1 timed out after 5 minutes with no response.** Pipeline execution aborted. Type a new query or `new query: …` to start fresh."
                 ).send()
@@ -2494,6 +2638,7 @@ async def _handle_pipeline_output(
 
             # --- Approve ---
             if chosen_action == "approve":
+                cl.user_session.set("pending_gate_1_run_id", None)
                 with _trace_span(
                     name="gate_1_action_approve",
                     span_type="TOOL",
@@ -2564,6 +2709,12 @@ async def _handle_pipeline_output(
                                 raw_data_path=final_state.get("raw_data_path") or cl.user_session.get("data_path"),
                                 channel_plot_paths=dp_plots,
                                 bad_channels_dropped=dp_dropped,
+                                metric_csv_paths=final_state.get("metric_csv_paths"),
+                                heatmap_image_paths=final_state.get("heatmap_image_paths"),
+                                network_image_paths=final_state.get("network_image_paths"),
+                                numerical_summaries=final_state.get("numerical_summaries"),
+                                evidence_summary=final_state.get("evidence_summary"),
+                                consolidated_report_path=final_state.get("consolidated_report_path"),
                             )
                             save_run_context(_ctx, run_context_path(dp_output, run_id))
                         except Exception as exc:
@@ -2581,6 +2732,12 @@ async def _handle_pipeline_output(
                         "data_prep_summary": dp_summary,
                         "parameter_manifest": dp_manifest,
                         "plan": plan,
+                        "metric_csv_paths": final_state.get("metric_csv_paths") or {},
+                        "heatmap_image_paths": final_state.get("heatmap_image_paths") or {},
+                        "network_image_paths": final_state.get("network_image_paths") or {},
+                        "numerical_summaries": final_state.get("numerical_summaries") or {},
+                        "evidence_summary": final_state.get("evidence_summary") or [],
+                        "consolidated_report_path": final_state.get("consolidated_report_path"),
                         "informational_artifacts": final_state.get("informational_artifacts") or output_state.get("informational_artifacts") or {},
                     } if dp_error is None and dp_output else None)
                     _reset_conversation_state()
@@ -2663,6 +2820,163 @@ async def _handle_pipeline_output(
                                 except (GeneratorExit, RuntimeError, Exception):
                                     pass
 
+                    # Display Connectivity Analysis results and plots inline
+                    conn_plots = final_state.get("heatmap_image_paths") or {}
+                    conn_networks = final_state.get("network_image_paths") or {}
+                    conn_summaries = final_state.get("numerical_summaries") or {}
+                    conn_evidence = final_state.get("evidence_summary") or []
+                    conn_csvs = final_state.get("metric_csv_paths") or {}
+                    consolidated_csv = final_state.get("consolidated_report_path")
+
+                    if conn_summaries or conn_evidence:
+                        # ── SECTION 1: Analysis Summary & 4-category Classification Breakdown ──
+                        cat_counts: Dict[str, int] = {}
+                        for item in conn_evidence:
+                            cat = getattr(item, "classification", None)
+                            cat_val = getattr(cat, "value", str(cat))
+                            cat_counts[cat_val] = cat_counts.get(cat_val, 0) + 1
+
+                        conn_lines = [
+                            "---",
+                            "## 📊 FC PIPELINE — CONSOLIDATED EEG CONNECTIVITY REPORT",
+                            "",
+                            "### Section 1 — Analysis Summary",
+                            "",
+                            f"- **Metrics Computed**: {', '.join(metric_label(m) for m in conn_summaries.keys() if m not in ('evidence_summary', 'consolidated_report'))}",
+                        ]
+
+                        if conn_evidence:
+                            conn_lines.extend([
+                                f"- **Total Channel Pairs Classified**: `{len(conn_evidence)}`",
+                                "",
+                                "#### 4-Category Classification Breakdown",
+                                "",
+                                f"| Category | Count |",
+                                f"|---|---|",
+                                f"| 🟢 Fully Convergent | {cat_counts.get('FULLY CONVERGENT', 0)} |",
+                                f"| 🔵 Confirmed Coupling (Phase-lagged) | {cat_counts.get('CONFIRMED COUPLING', 0)} |",
+                                f"| 🟡 Zero-Lag Coupling, Cause Unresolved | {cat_counts.get('ZERO-LAG COUPLING, CAUSE UNRESOLVED', 0)} |",
+                                f"| ⚪ No Coupling | {cat_counts.get('NO COUPLING', 0)} |",
+                            ])
+
+                        # Per-metric summaries table
+                        display_metrics = [m for m in conn_summaries.keys() if m not in ('evidence_summary', 'consolidated_report')]
+                        if display_metrics:
+                            conn_lines.extend([
+                                "",
+                                "#### Per-Metric Numerical Summaries",
+                                "",
+                                "| Metric | Mean | Std | Median | Sparsity |",
+                                "|---|---|---|---|---|",
+                            ])
+                            for m in display_metrics:
+                                s = conn_summaries.get(m, {})
+                                conn_lines.append(
+                                    f"| {metric_label(m)} | {s.get('mean', 0):.4f} | {s.get('std', 0):.4f} | {s.get('median', 0):.4f} | {s.get('sparsity', 0):.2%} |"
+                                )
+
+                        if conn_csvs:
+                            n_data_exports = len([k for k in conn_csvs if k not in ('consolidated_report',)])
+                            conn_lines.append("\n- **Primary Output**: one consolidated CSV with all 5 metrics (see Section 2); per-metric matrices are kept in `outputs/`")
+
+                        conn_lines.append("")
+                        await cl.Message(content="\n".join(conn_lines)).send()
+
+                        # ── SECTION 2: ONE consolidated CSV (primary numerical deliverable) ──
+                        # The same file backs the report link, the preview panel and the download.
+                        if consolidated_csv and Path(consolidated_csv).exists():
+                            try:
+                                import csv as _csv
+
+                                consolidated_path = Path(consolidated_csv)
+                                with open(consolidated_path, "r", encoding="utf-8", newline="") as _f:
+                                    _reader = _csv.reader(_f)
+                                    _headers = next(_reader, [])
+                                    n_rows = sum(1 for _ in _reader)
+                                consolidated_file = cl.File(
+                                    path=str(consolidated_path),
+                                    name=consolidated_path.name,
+                                    display="inline",
+                                )
+                                await cl.Message(
+                                    content=(
+                                        "### Section 2 — Consolidated Connectivity Report\n\n"
+                                        f"**`{consolidated_path.name}`** — {n_rows} channel pairs × "
+                                        f"{len(_headers)} columns (PLI, wPLI, ImCoh, PLV, Coherence per pair).\n\n"
+                                        "Click **Preview** to read the table in the right-hand panel "
+                                        "(the chat stays open), or use the file link to **download** it."
+                                    ),
+                                    elements=[consolidated_file],
+                                    actions=[
+                                        _preview_action(consolidated_path, label="👁️ Preview consolidated CSV"),
+                                        _close_preview_action(),
+                                    ],
+                                ).send()
+                            except Exception as e:
+                                logger.warning("Failed to render consolidated CSV section: %s", e)
+                                await cl.Message(
+                                    content=(
+                                        "### Section 2 — Consolidated Connectivity Report\n\n"
+                                        f"⚠️ Report link unavailable ({type(e).__name__}), but the file was generated in `outputs/`."
+                                    )
+                                ).send()
+
+                        # ── SECTION 3: All 5 Heatmaps Inline ──
+                        if conn_plots:
+                            await cl.Message(content="### Section 3 — Connectivity Heatmaps (All 5 Metrics)").send()
+
+                        metric_display_order = ["pli", "wpli", "imcoh", "plv", "coh"]
+                        ordered_heatmaps = []
+                        for m in metric_display_order:
+                            if m in conn_plots:
+                                ordered_heatmaps.append((m, conn_plots[m]))
+                        # Append any metric not in the expected order
+                        for m, p in conn_plots.items():
+                            if m not in metric_display_order:
+                                ordered_heatmaps.append((m, p))
+
+                        for metric_name, h_path in ordered_heatmaps:
+                            if Path(h_path).exists():
+                                img = cl.Image(path=h_path, name=f"heatmap_{metric_name}", display="inline")
+                                try:
+                                    await cl.Message(
+                                        content=f"#### 🌡️ {metric_label(metric_name)} Heatmap",
+                                        elements=[img],
+                                        actions=[_preview_action(h_path, label=f"👁️ Open {metric_label(metric_name)} heatmap in panel")],
+                                    ).send()
+                                except (GeneratorExit, RuntimeError, Exception) as e:
+                                    logger.warning("Failed to inline heatmap %r: %s", metric_name, e)
+
+                        # ── SECTION 4: Supporting files (kept on disk, not listed as attachments) ──
+                        # The consolidated CSV above is the primary numerical deliverable. Per-metric
+                        # matrices and the evidence summary stay in outputs/ for downstream use; the
+                        # network graphs are shown inline below.
+                        if conn_csvs:
+                            await cl.Message(
+                                content=(
+                                    "### Section 4 — Supporting Files\n\n"
+                                    "Per-metric matrices and the evidence summary are saved in `outputs/` "
+                                    "for downstream use. Everything needed to read the results is in the "
+                                    "consolidated report above."
+                                )
+                            ).send()
+
+                        # ── Inline Network Graphs (after download section, for visual inspection) ──
+                        if conn_networks:
+                            await cl.Message(content="### Circular Network Graphs (Top 40% Connectivity Threshold)").send()
+                            for metric_name in metric_display_order:
+                                if metric_name in conn_networks:
+                                    n_path = conn_networks[metric_name]
+                                    if Path(n_path).exists():
+                                        img = cl.Image(path=n_path, name=f"network_{metric_name}", display="inline")
+                                        try:
+                                            await cl.Message(
+                                                content=f"#### 🕸️ {metric_label(metric_name)} Network Graph",
+                                                elements=[img],
+                                            ).send()
+                                        except (GeneratorExit, RuntimeError, Exception) as e:
+                                            logger.warning("Failed to inline network graph %r: %s", metric_name, e)
+
                     if dp_error is None and dp_output:
                         # Non-blocking: users may ask post-run inspection questions immediately.
                         # The explicit button is the only action that unlocks a fresh pipeline run.
@@ -2694,6 +3008,7 @@ async def _handle_pipeline_output(
                     _reset_conversation_state()
                     cl.user_session.set("gate_1_approved", False)
                     cl.user_session.set("preflight_confirmed", False)
+                    cl.user_session.set("pending_gate_1_run_id", None)
                     output_state["gate_1_approved"] = False
                     output_state["preflight_confirmed"] = False
                     await cl.Message(
@@ -2767,6 +3082,14 @@ async def _handle_pipeline_output(
                     feedback = f"Change {entry_name} to {edit_value}"
                     revision_query = _build_revision_query(feedback)
                     base_run_id, next_run_id, rev_counter, rev_tags = _prepare_revision_run(run_id)
+
+                    cl.user_session.set("pending_gate_1_run_id", None)
+                    pipeline_app = cl.user_session.get("graph")
+                    if pipeline_app:
+                        try:
+                            list(pipeline_app.stream(Command(resume={"action": "edit"}), config={"configurable": {"thread_id": run_id}}))
+                        except Exception as e:
+                            logger.warning("Error finalizing previous graph on edit: %s", e)
 
                     # Also keep accumulated_query updated for any follow-up
                     # plain messages that route through on_message's else-branch
@@ -2897,6 +3220,14 @@ async def _handle_pipeline_output(
                 # scientific-axis per-row edit path.
                 revision_query = _build_revision_query(feedback_text)
                 base_run_id, next_run_id, rev_counter, rev_tags = _prepare_revision_run(run_id)
+
+                cl.user_session.set("pending_gate_1_run_id", None)
+                pipeline_app = cl.user_session.get("graph")
+                if pipeline_app:
+                    try:
+                        list(pipeline_app.stream(Command(resume={"action": "request_changes"}), config={"configurable": {"thread_id": run_id}}))
+                    except Exception as e:
+                        logger.warning("Error finalizing previous graph on request_changes: %s", e)
 
                 # Also keep accumulated_query updated for any follow-up
                 # plain messages that route through on_message's else-branch
