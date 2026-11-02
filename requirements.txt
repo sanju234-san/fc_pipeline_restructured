@@ -21,3 +21,5 @@ deepagents>=0.7.0
 PyQt5>=5.15
 plotly>=5.0.0
 
+mne
+mne-connectivity
