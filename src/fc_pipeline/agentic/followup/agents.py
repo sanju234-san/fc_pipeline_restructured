@@ -188,11 +188,19 @@ def make_offload_tools(
 def _load_plot_images(ctx: Mapping[str, Any]) -> Dict[str, str]:
     """Return ``{plot_key: base64_data_uri}`` for the stored diagnostic PNGs.
 
-    The keys are exactly those in the run context's ``channel_plot_paths``
+    The keys are those in the run context's ``channel_plot_paths``
     (for example ``channels_before``, ``channels_after``, ``channel_variance``,
-    ``psd_overview``). Missing or unreadable files are skipped.
+    ``psd_overview``) plus any connectivity heatmaps or network graphs.
+    Missing or unreadable files are skipped.
     """
-    plots = (ctx.get("channel_plot_paths") or {}) if isinstance(ctx, Mapping) else {}
+    if not isinstance(ctx, Mapping):
+        return {}
+    plots: Dict[str, Any] = dict(ctx.get("channel_plot_paths") or {})
+    conn = ctx.get("connectivity") if isinstance(ctx.get("connectivity"), Mapping) else {}
+    for m, p in (conn.get("heatmap_image_paths") or {}).items():
+        plots.setdefault(f"heatmap_{m}", p)
+    for m, p in (conn.get("network_image_paths") or {}).items():
+        plots.setdefault(f"network_{m}", p)
     result: Dict[str, str] = {}
     for label, raw_path in plots.items():
         if not raw_path:
@@ -497,15 +505,42 @@ def run_followup_agent(
     except Exception as exc:
         if not allow_harness_import_errors:
             raise
-        logger.warning("deepagents import failed — falling back to deterministic QA: %s", exc)
-        fallback = (
-            det_answer
-            if (det_answer := manager.answer_deterministically(user_message))
-            else _fallback_answer(user_message, intent)
-        )
+        logger.debug("deepagents import failed — falling back to deterministic/LLM QA: %s", exc)
+        det_answer = manager.answer_deterministically(user_message)
+        if det_answer:
+            return FollowUpResult(
+                kind=FollowUpResultKind.ANSWERED,
+                assistant_text=det_answer,
+                delegated_to="DeterministicFallback",
+                error=f"deepagents unavailable: {exc}",
+            )
+        if hasattr(chat_model, "invoke"):
+            try:
+                resp = chat_model.invoke(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are RunContextQAAgent answering questions strictly from the "
+                                "completed EEG FC run context below. Never invent numbers.\n\n"
+                                f"{selection.system_prompt_fragment}"
+                            ),
+                        },
+                        {"role": "user", "content": str(user_message)},
+                    ]
+                )
+                llm_text = _content_to_text(getattr(resp, "content", resp))
+                if llm_text:
+                    return FollowUpResult(
+                        kind=FollowUpResultKind.ANSWERED,
+                        assistant_text=llm_text,
+                        delegated_to="RunContextQAAgent",
+                    )
+            except Exception:
+                pass
         return FollowUpResult(
             kind=FollowUpResultKind.ANSWERED,
-            assistant_text=fallback,
+            assistant_text=_fallback_answer(user_message, intent),
             delegated_to="DeterministicFallback",
             error=f"deepagents unavailable: {exc}",
         )

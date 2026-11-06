@@ -231,7 +231,7 @@ def apply_input_rail(state: GraphState, text: str) -> Optional[Dict[str, Any]]:
         }
     return {  # DENY
         **halted,
-        "informational_response": "🛡️ Guardrail: Cannot process this query.",
+        "informational_response": "Cannot process this query.",
         "informational_artifacts": None,
         "decision_context": None,
     }
@@ -268,7 +268,7 @@ def apply_output_rail(state: GraphState) -> Dict[str, Any]:
     if decision.behavior == DecisionType.ASK_HUMAN:
         return {"decision_context": decision.decision_context}
     return {  # DENY
-        "informational_response": "🛡️ Guardrail: Cannot process this query.",
+        "informational_response": "Cannot process this query.",
         "decision_context": None,
     }
 
@@ -367,6 +367,26 @@ def query_transformer_node_adapter(state: GraphState) -> Dict[str, Any]:
     }
 
 
+def _persist_stage_context(state: GraphState, update: Dict[str, Any]) -> None:
+    """Persist progressive run context across pipeline stages when an output path exists."""
+    merged = {**state, **update}
+    prep_path = merged.get("preprocessed_data_path")
+    run_id = str(merged.get("run_id") or "unknown")
+    if not prep_path:
+        return
+    try:
+        from fc_pipeline.pipeline.run_context import (
+            build_run_context_from_state,
+            run_context_path,
+            save_run_context,
+        )
+
+        ctx = build_run_context_from_state(merged)
+        save_run_context(ctx, run_context_path(str(prep_path), run_id))
+    except Exception as exc:
+        logger.warning("Could not persist stage run context for %s: %s", run_id, exc)
+
+
 def data_prep_node_adapter(state: GraphState) -> Dict[str, Any]:
     """LangGraph node adapter for the deterministic Data Preparation stage.
 
@@ -416,6 +436,7 @@ def data_prep_node_adapter(state: GraphState) -> Dict[str, Any]:
             result.summary.epoch_count if result.summary else 0,
             result.preprocessed_data_path,
         )
+        _persist_stage_context(state, update)
     else:
         logger.error("Data Preparation failed: %s", result.error)
 
@@ -431,6 +452,41 @@ def connectivity_node_adapter(state: GraphState) -> Dict[str, Any]:
     """
     from fc_pipeline.agentic.connectivity.agent import run_connectivity_agent
 
-    return run_connectivity_agent(state)
+    update = run_connectivity_agent(state)
+    if not update.get("pipeline_error"):
+        _persist_stage_context(state, update)
+    return update
+
+
+def evaluator_node_adapter(state: GraphState) -> Dict[str, Any]:
+    """LangGraph node adapter for the Multimodal Evaluator stage (Node 4)."""
+    from fc_pipeline.agentic.evaluator.agent import run_evaluator_agent
+
+    llm = None
+    try:
+        llm = get_supervisor_llm()
+    except Exception:
+        llm = None
+
+    update = run_evaluator_agent(state, llm=llm)
+    if not update.get("pipeline_error"):
+        _persist_stage_context(state, update)
+    return update
+
+
+def synthesis_node_adapter(state: GraphState) -> Dict[str, Any]:
+    """LangGraph node adapter for the Final Synthesis stage (Node 5)."""
+    from fc_pipeline.agentic.synthesis.agent import run_synthesis_agent
+
+    llm = None
+    try:
+        llm = get_supervisor_llm()
+    except Exception:
+        llm = None
+
+    update = run_synthesis_agent(state, llm=llm)
+    if not update.get("pipeline_error"):
+        _persist_stage_context(state, update)
+    return update
 
 

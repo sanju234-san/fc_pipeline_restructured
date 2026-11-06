@@ -22,26 +22,29 @@ def _newest(patterns):
 
 
 def _load(path):
+    import warnings
     import mne
     low = path.lower()
     bounds = []
-    if low.endswith(".edf"):
-        raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
-    elif low.endswith(".bdf"):
-        raw = mne.io.read_raw_bdf(path, preload=True, verbose=False)
-    else:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        if low.endswith(".edf"):
+            raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+        elif low.endswith(".bdf"):
+            raw = mne.io.read_raw_bdf(path, preload=True, verbose=False)
+        else:
+            try:
+                raw = mne.io.read_raw_fif(path, preload=True, verbose=False)
+            except Exception:
+                ep = mne.read_epochs(path, preload=True, verbose=False)
+                data = ep.get_data()
+                n, _, t = data.shape
+                raw = mne.io.RawArray(np.concatenate(list(data), axis=1), ep.info.copy(), verbose=False)
+                bounds = [i * t / ep.info["sfreq"] for i in range(1, n)]
         try:
-            raw = mne.io.read_raw_fif(path, preload=True, verbose=False)
+            mne.datasets.eegbci.standardize(raw)
         except Exception:
-            ep = mne.read_epochs(path, preload=True, verbose=False)
-            data = ep.get_data()
-            n, _, t = data.shape
-            raw = mne.io.RawArray(np.concatenate(list(data), axis=1), ep.info.copy(), verbose=False)
-            bounds = [i * t / ep.info["sfreq"] for i in range(1, n)]
-    try:
-        mne.datasets.eegbci.standardize(raw)
-    except Exception:
-        pass
+            pass
     return raw, bounds
 
 

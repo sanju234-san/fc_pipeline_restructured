@@ -236,7 +236,10 @@ def _run(
     output_path = build_safe_output_path(
         output_dir, params.run_id, "preprocessed_epo", ".fif"
     )
-    epochs_all.save(str(output_path), overwrite=True, verbose=False)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        epochs_all.save(str(output_path), overwrite=True, verbose=False)
     _trace(params.run_id, "data_prep_stage", {"stage": "save", "status": "completed", "output_file": output_path.name})
     logger.info("Preprocessed epochs saved: %s (%d channels)", output_path.name, len(epochs_all.ch_names))
 

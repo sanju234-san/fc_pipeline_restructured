@@ -1550,6 +1550,18 @@ def _followup_compare_stats(series: Dict[str, Dict[str, Any]]) -> List[str]:
 
 
 _PLOT_EXPLANATIONS = {
+    "channels_before": (
+        "Time-series traces of the raw EEG channels before Data Prep cleaning and filtering."
+    ),
+    "channels_after": (
+        "Time-series traces of the retained EEG channels after bad-channel removal, CAR re-referencing, and band-pass filtering."
+    ),
+    "before": (
+        "Time-series traces of the raw EEG channels before Data Prep cleaning and filtering."
+    ),
+    "after": (
+        "Time-series traces of the retained EEG channels after bad-channel removal, CAR re-referencing, and band-pass filtering."
+    ),
     "channel_variance": (
         "Bar chart of each retained channel's mean variance across epochs. Bars far above or "
         "below the rest point to channels with residual noise or a nearly flat signal."
@@ -1664,14 +1676,30 @@ async def _followup_explain(state: Dict[str, Any]) -> None:
     }
     lines = ["### 📖 Explaining the completed analysis", "", "Reusing the stored results — nothing was re-run."]
     lines += _format_data_prep_explanation(view_state, state.get("parameter_manifest") or [])
-    plots = state.get("channel_plot_paths") or {}
-    if plots:
+    plots = dict(state.get("channel_plot_paths") or {})
+    heatmaps = state.get("heatmap_image_paths") or {}
+    networks = state.get("network_image_paths") or {}
+    all_plots: Dict[str, str] = dict(plots)
+    for m, p in heatmaps.items():
+        if p:
+            all_plots[f"heatmap_{m}"] = str(p)
+    for m, p in networks.items():
+        if p:
+            all_plots[f"network_{m}"] = str(p)
+    if all_plots:
         lines += ["", "### 🖼️ What each plot shows", ""]
-        for name in plots:
-            desc = _PLOT_EXPLANATIONS.get(name, "Deterministic Data Prep diagnostic plot.")
+        for name in all_plots:
+            if name.startswith("heatmap_"):
+                metric = name[len("heatmap_"):]
+                desc = f"Pairwise functional connectivity matrix heatmap for **{metric}** across the retained channels."
+            elif name.startswith("network_"):
+                metric = name[len("network_"):]
+                desc = f"Circular sensor-space network graph showing the strongest **{metric}** connections."
+            else:
+                desc = _PLOT_EXPLANATIONS.get(name, "Deterministic Data Prep diagnostic plot.")
             lines.append(f"- **{name.replace('_', ' ').title()}:** {desc}")
     await cl.Message(content="\n".join(lines)).send()
-    await _followup_send_plot_images(plots, "### Diagnostic plots from the completed run")
+    await _followup_send_plot_images(all_plots, "### Diagnostic plots from the completed run")
 
 
 
@@ -1743,14 +1771,7 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
         if decision is not None and decision.behavior in (DecisionType.DENY, DecisionType.ASK_HUMAN):
             rail_status = (decision.decision_context or {}).get("details", {}).get("rail_status")
             if rail_status == "blocked" or decision.behavior == DecisionType.DENY:
-                reason = decision.reason or "The input guardrail flagged this message as a possible jailbreak / prompt-injection attempt, or as unrelated to EEG analysis."
-                await cl.Message(
-                    content=(
-                        f"🛡️ **Guardrail: Cannot process this query.**\n\n"
-                        f"{reason}\n\n"
-                        f"_If you want to start a new EEG analysis, press the **🆕 New query** button._"
-                    )
-                ).send()
+                await cl.Message(content="Cannot process this query.").send()
                 return True
     except Exception as exc:
         logger.warning("Follow-up input guardrail check failed: %s: %s", type(exc).__name__, exc)
@@ -1840,10 +1861,10 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
         return True
 
     # When the plot interpreter could not run (for example the endpoint cannot
-    # read images), fall back to the deterministic explanation of the stored
-    # plots instead of a bare apology.
+    # read images or no LLM is configured), fall back to the deterministic
+    # explanation of the stored plots instead of a bare apology.
     if (
-        result.kind == FollowUpResultKind.ERROR
+        (result.kind == FollowUpResultKind.ERROR or result.delegated_to == "DeterministicFallback")
         and manager is not None
         and manager.route_intent(text) == "plot_interpreter"
     ):
@@ -1864,7 +1885,13 @@ async def _handle_completed_run_followup(user_text: str) -> bool:
     # Plot-interpreter responses may want to attach inline before/after images.
     elements: List[Any] = []
     if result.kind == FollowUpResultKind.NEEDS_PLOT:
-        plots = state.get("channel_plot_paths") or {}
+        plots = dict(state.get("channel_plot_paths") or {})
+        for m, p in (state.get("heatmap_image_paths") or {}).items():
+            if p:
+                plots[f"heatmap_{m}"] = str(p)
+        for m, p in (state.get("network_image_paths") or {}).items():
+            if p:
+                plots[f"network_{m}"] = str(p)
         for label in result.image_paths or ("before", "after"):
             raw_path = plots.get(label)
             if raw_path and Path(str(raw_path)).exists():
@@ -1957,6 +1984,22 @@ def _close_preview_action() -> cl.Action:
     )
 
 
+def _ensure_outputs_static_mount() -> None:
+    """Mount outputs/ at /outputs before Chainlit's catch-all route so Markdown <img> tags resolve."""
+    try:
+        from chainlit.server import app
+        from starlette.routing import Mount
+        from starlette.staticfiles import StaticFiles
+
+        if not any(getattr(r, "path", None) == "/outputs" for r in app.router.routes):
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            app.router.routes.insert(
+                0, Mount("/outputs", app=StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+            )
+    except Exception:
+        pass
+
+
 def _build_preview_elements(path: Path) -> tuple[list, str]:
     """Return (sidebar elements, note) holding the file's ACTUAL contents."""
     ext = path.suffix.lower()
@@ -1972,7 +2015,15 @@ def _build_preview_elements(path: Path) -> tuple[list, str]:
         note = f"{len(df)} of {total} rows × {len(df.columns)} columns"
         return [cl.Dataframe(data=df, name=name, display="side", size="large")], note
     if ext in _PREVIEW_MARKDOWN:
-        text = path.read_text(encoding="utf-8", errors="replace")[:_PREVIEW_MAX_TEXT_CHARS]
+        _ensure_outputs_static_mount()
+        raw_md = path.read_text(encoding="utf-8", errors="replace")
+        raw_md = re.sub(r"!\[([^\]]*)\]\(data:[^)]+\)", "", raw_md)
+        raw_md = re.sub(
+            r"!\[([^\]]*)\]\((?:outputs/)?(plots|heatmaps|networks)/([^)]+)\)",
+            r"![\1](/outputs/\2/\3)",
+            raw_md,
+        )
+        text = raw_md[:_PREVIEW_MAX_TEXT_CHARS]
         return [cl.Text(name=name, content=text, display="side")], note
     if ext in _PREVIEW_TEXT:
         text = path.read_text(encoding="utf-8", errors="replace")[:_PREVIEW_MAX_TEXT_CHARS]
@@ -2112,16 +2163,9 @@ async def _on_open_eeg_viewer(action: cl.Action):
         except Exception:
             pass
 
-    # ── 3. Honest status notification ─────────────────────────────────────
+    # ── 3. Status notification ────────────────────────────────────────────
     status_lines: list[str] = []
-    if launch is None:
-        status_lines.append(f"⚠️ **Viewer could not be launched** for *{plot_title}*.")
-    elif not launch.ok:
-        status_lines.append(
-            f"⚠️ **Native EEG viewer could not start** for *{plot_title}*.\n"
-            f"- Reason: {launch.reason or 'unknown'}"
-        )
-    elif launch.mode == "interactive":
+    if launch and launch.ok and launch.mode == "interactive":
         src = launch.data_type or "EEG"
         status_lines.append(
             f"🖥️ **Native interactive EEG viewer opened** for *{plot_title}*\n"
@@ -2131,22 +2175,12 @@ async def _on_open_eeg_viewer(action: cl.Action):
             "- **Right scrollbar** → drag the thumb to jump anywhere\n"
             "- Shift+Wheel / ← → → slide time  |  Zoom +/− → amplitude gain"
         )
-    else:  # mode == "static"
-        if is_channel_plot:
-            status_lines.append(
-                f"⚠️ **Channel scrolling is NOT available for *{plot_title}*** — the desktop "
-                "window opened as a **static pan/zoom image** rather than the interactive "
-                "channel viewer.\n"
-                f"- Reason: {launch.reason or 'EEG data could not be resolved/loaded'}\n"
-                "- The in-browser viewer on the right still allows zoom/pan."
-            )
-        else:
-            status_lines.append(
-                f"🖼 **Image viewer opened** for *{plot_title}* (static pan/zoom — this plot "
-                "has no per-channel data to scroll)."
-            )
-        if launch.log_path:
-            status_lines.append(f"- Diagnostics: `{launch.log_path}`")
+    elif browser_opened:
+        status_lines.append(
+            f"🔍 **Interactive viewer opened** for *{plot_title}* in the right-hand panel."
+        )
+    elif launch is None or not launch.ok:
+        status_lines.append(f"ℹ️ Could not open viewer for *{plot_title}*.")
 
     if browser_opened and not (launch and launch.mode == "interactive"):
         status_lines.append(
@@ -2156,7 +2190,8 @@ async def _on_open_eeg_viewer(action: cl.Action):
             "- 🔄 **Double-click** → Reset view to fit"
         )
 
-    await cl.Message(content="\n".join(status_lines)).send()
+    if status_lines:
+        await cl.Message(content="\n".join(status_lines)).send()
 
 
 
@@ -2914,48 +2949,48 @@ async def _handle_pipeline_output(
 
                     # Persist the run context next to the outputs so follow-up questions
                     # survive a lost chat session. Persistence problems never break the run.
-                    if dp_error is None and dp_output:
+                    completed_state = (
+                        {
+                            "run_id": run_id,
+                            "raw_data_path": final_state.get("raw_data_path") or output_state.get("raw_data_path") or cl.user_session.get("data_path"),
+                            "preprocessed_data_path": dp_output,
+                            "channel_plot_paths": dict(dp_plots),
+                            "bad_channels_dropped": list(dp_dropped),
+                            "data_prep_summary": dp_summary,
+                            "parameter_manifest": dp_manifest,
+                            "plan": plan,
+                            "user_request": final_state.get("user_request") or output_state.get("user_request") or accumulated_query,
+                            "resolved_frequency_band_info": final_state.get("resolved_frequency_band_info") or output_state.get("resolved_frequency_band_info"),
+                            "resolved_channel_info": final_state.get("resolved_channel_info") or output_state.get("resolved_channel_info"),
+                            "resolved_condition_value": final_state.get("resolved_condition_value") or output_state.get("resolved_condition_value"),
+                            "dataset_sfreq": final_state.get("dataset_sfreq") or output_state.get("dataset_sfreq"),
+                            "dataset_duration_seconds": final_state.get("dataset_duration_seconds") or output_state.get("dataset_duration_seconds"),
+                            "dataset_reference": final_state.get("dataset_reference") or output_state.get("dataset_reference"),
+                            "metric_csv_paths": final_state.get("metric_csv_paths") or {},
+                            "heatmap_image_paths": final_state.get("heatmap_image_paths") or {},
+                            "network_image_paths": final_state.get("network_image_paths") or {},
+                            "numerical_summaries": final_state.get("numerical_summaries") or {},
+                            "evidence_summary": final_state.get("evidence_summary") or [],
+                            "consolidated_report_path": final_state.get("consolidated_report_path"),
+                            "evaluation_verdict": final_state.get("evaluation_verdict"),
+                            "evaluation_summary_csv_path": final_state.get("evaluation_summary_csv_path"),
+                            "final_report_path": final_state.get("final_report_path"),
+                            "informational_artifacts": final_state.get("informational_artifacts") or output_state.get("informational_artifacts") or {},
+                        }
+                        if dp_error is None and dp_output
+                        else None
+                    )
+                    if completed_state is not None:
                         try:
-                            _ctx = build_run_context(
-                                run_id=run_id,
-                                plan=plan,
-                                data_prep_summary=dp_summary,
-                                parameter_manifest=dp_manifest,
-                                preprocessed_data_path=dp_output,
-                                raw_data_path=final_state.get("raw_data_path") or cl.user_session.get("data_path"),
-                                channel_plot_paths=dp_plots,
-                                bad_channels_dropped=dp_dropped,
-                                metric_csv_paths=final_state.get("metric_csv_paths"),
-                                heatmap_image_paths=final_state.get("heatmap_image_paths"),
-                                network_image_paths=final_state.get("network_image_paths"),
-                                numerical_summaries=final_state.get("numerical_summaries"),
-                                evidence_summary=final_state.get("evidence_summary"),
-                                consolidated_report_path=final_state.get("consolidated_report_path"),
-                            )
+                            _ctx = build_run_context_from_state(completed_state)
                             save_run_context(_ctx, run_context_path(dp_output, run_id))
                         except Exception as exc:
                             logger.warning("Run context not persisted: %s: %s", type(exc).__name__, exc)
-
-                    # Preserve the completed run as a read-only artifact context.
-                    # Ordinary follow-up messages must not restart Supervisor/Data Prep.
-                    cl.user_session.set("completed_run_active", dp_error is None and bool(dp_output))
-                    cl.user_session.set("completed_run_state", {
-                        "run_id": run_id,
-                        "raw_data_path": final_state.get("raw_data_path") or output_state.get("raw_data_path") or cl.user_session.get("data_path"),
-                        "preprocessed_data_path": dp_output,
-                        "channel_plot_paths": dict(dp_plots),
-                        "bad_channels_dropped": list(dp_dropped),
-                        "data_prep_summary": dp_summary,
-                        "parameter_manifest": dp_manifest,
-                        "plan": plan,
-                        "metric_csv_paths": final_state.get("metric_csv_paths") or {},
-                        "heatmap_image_paths": final_state.get("heatmap_image_paths") or {},
-                        "network_image_paths": final_state.get("network_image_paths") or {},
-                        "numerical_summaries": final_state.get("numerical_summaries") or {},
-                        "evidence_summary": final_state.get("evidence_summary") or [],
-                        "consolidated_report_path": final_state.get("consolidated_report_path"),
-                        "informational_artifacts": final_state.get("informational_artifacts") or output_state.get("informational_artifacts") or {},
-                    } if dp_error is None and dp_output else None)
+                        _activate_completed_run(completed_state)
+                    else:
+                        cl.user_session.set("completed_run_active", False)
+                        cl.user_session.set("completed_run_state", None)
+                        cl.user_session.set("deepagents_followup_manager", None)
                     _reset_conversation_state()
                     cl.user_session.set("gate_1_approved", True)
                     cl.user_session.set("preflight_confirmed", True)
@@ -3226,6 +3261,88 @@ async def _handle_pipeline_output(
                                             ).send()
                                         except (GeneratorExit, RuntimeError, Exception) as e:
                                             logger.warning("Failed to inline network graph %r: %s", metric_name, e)
+
+                    # ── SECTION 5 & 6: Evaluator Audit (Node 4) & Final Synthesis Report (Node 5) ──
+                    eval_verdict = final_state.get("evaluation_verdict")
+                    eval_csv = final_state.get("evaluation_summary_csv_path")
+                    final_report = final_state.get("final_report_path")
+
+                    if eval_verdict is not None:
+                        v_val = getattr(getattr(eval_verdict, "overall_verdict", None), "value", "pass")
+                        v_badge = str(v_val).upper()
+                        art = getattr(eval_verdict, "artifacts", None)
+                        eval_lines = [
+                            "---",
+                            f"### Section 5 — Multimodal Evaluator Quality Audit (`{v_badge}`)",
+                            "",
+                            str(getattr(eval_verdict, "visual_observations", "") or ""),
+                            "",
+                        ]
+                        if art is not None:
+                            oc = getattr(art, "ocular_contamination", None)
+                            mu = getattr(art, "muscle_contamination", None)
+                            ep = getattr(art, "electrode_pop", None)
+                            if oc and mu and ep:
+                                eval_lines.extend([
+                                    "| Artifact Heuristic | Status | Confidence | Detail |",
+                                    "|---|---|---|---|",
+                                    f"| Ocular Contamination | {'⚠️ Detected' if oc.detected else '✅ Clear'} | {oc.confidence:.2f} | {oc.detail} |",
+                                    f"| Muscle Contamination | {'⚠️ Detected' if mu.detected else '✅ Clear'} | {mu.confidence:.2f} | {mu.detail} |",
+                                    f"| Electrode Pop | {'⚠️ Detected' if ep.detected else '✅ Clear'} | {ep.confidence:.2f} | {ep.detail} |",
+                                    "",
+                                ])
+                            top_reads = getattr(art, "top_unresolved_visual_reads", None) or []
+                            if top_reads:
+                                eval_lines.extend([
+                                    "#### Top Unresolved Zero-Lag Pairs (Evaluator Topology Read)",
+                                    "",
+                                    "| Pair | Zero-Lag Mean | Visual Topology Read | Note |",
+                                    "|---|---|---|---|",
+                                ])
+                                for tr in top_reads:
+                                    p_str = f"`{tr.channel_pair[0]}-{tr.channel_pair[1]}`"
+                                    r_str = getattr(tr.evaluator_visual_read, "value", str(tr.evaluator_visual_read or "indeterminate"))
+                                    eval_lines.append(
+                                        f"| {p_str} | {tr.zero_lag_mean:.4f} | `{r_str}` | {tr.evaluator_visual_note or ''} |"
+                                    )
+                                eval_lines.append("")
+
+                        recs = getattr(eval_verdict, "recommendations_for_user", None) or []
+                        if recs:
+                            eval_lines.append("**Scientific Recommendations:**")
+                            for r in recs:
+                                eval_lines.append(f"- {r}")
+                            eval_lines.append("")
+
+                        eval_elements = []
+                        eval_actions = []
+                        if eval_csv and Path(str(eval_csv)).exists():
+                            eval_path = Path(str(eval_csv))
+                            eval_elements.append(cl.File(path=str(eval_path), name=eval_path.name, display="inline"))
+                            eval_actions.append(_preview_action(eval_path, label="👁️ Preview evaluation CSV"))
+
+                        await cl.Message(
+                            content="\n".join(eval_lines),
+                            elements=eval_elements,
+                            actions=eval_actions,
+                        ).send()
+
+                    if final_report and Path(str(final_report)).exists():
+                        rep_path = Path(str(final_report))
+                        rep_file = cl.File(path=str(rep_path), name=rep_path.name, display="inline")
+                        await cl.Message(
+                            content=(
+                                "### Section 6 — Final Synthesis Report (Gate 2 Verified)\n\n"
+                                f"**`{rep_path.name}`** — Self-contained scientific Markdown report with "
+                                "locked manifest parameters, cross-metric evidence table, methodological caveats, "
+                                "and Evaluator audit findings."
+                            ),
+                            elements=[rep_file],
+                            actions=[
+                                _preview_action(rep_path, label="👁️ Preview final report"),
+                                _close_preview_action(),
+                            ],
+                        ).send()
 
                     if dp_error is None and dp_output:
                         # Non-blocking: users may ask post-run inspection questions immediately.

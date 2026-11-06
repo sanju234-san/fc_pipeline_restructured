@@ -123,6 +123,16 @@ def build_run_context(
     numerical_summaries: Optional[Mapping[str, Any]] = None,
     evidence_summary: Optional[List[Any]] = None,
     consolidated_report_path: Optional[str] = None,
+    user_request: Optional[str] = None,
+    resolved_frequency_band_info: Optional[Mapping[str, Any]] = None,
+    resolved_channel_info: Optional[Mapping[str, Any]] = None,
+    resolved_condition_value: Optional[str] = None,
+    dataset_sfreq: Optional[float] = None,
+    dataset_duration_seconds: Optional[float] = None,
+    dataset_reference: Optional[str] = None,
+    evaluation_verdict: Any = None,
+    evaluation_summary_csv_path: Optional[str] = None,
+    final_report_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the JSON-serialisable run context from the pieces of a finished run."""
     manifest_rows = []
@@ -133,12 +143,21 @@ def build_run_context(
                 "category": _jsonable(_get(entry, "category")),
                 "proposed_value": _jsonable(_get(entry, "proposed_value")),
                 "human_approved_value": _jsonable(_get(entry, "human_approved_value")),
+                "confidence": _jsonable(_get(entry, "confidence")),
+                "needs_human_input": _jsonable(_get(entry, "needs_human_input")),
                 "risk_tier": _jsonable(_get(entry, "risk_tier")),
             }
         )
 
     connectivity_data = None
-    if metric_csv_paths or heatmap_image_paths or numerical_summaries or evidence_summary or consolidated_report_path:
+    if (
+        metric_csv_paths
+        or heatmap_image_paths
+        or network_image_paths
+        or numerical_summaries
+        or evidence_summary
+        or consolidated_report_path
+    ):
         connectivity_data = {
             "metric_csv_paths": _jsonable(dict(metric_csv_paths or {})),
             "heatmap_image_paths": _jsonable(dict(heatmap_image_paths or {})),
@@ -148,6 +167,42 @@ def build_run_context(
             "consolidated_report_path": _jsonable(consolidated_report_path),
         }
 
+    supervisor_data = None
+    if any(
+        v is not None
+        for v in (
+            user_request,
+            resolved_frequency_band_info,
+            resolved_channel_info,
+            resolved_condition_value,
+            dataset_sfreq,
+            dataset_duration_seconds,
+            dataset_reference,
+        )
+    ):
+        supervisor_data = {
+            "user_request": _jsonable(user_request),
+            "resolved_frequency_band_info": _jsonable(resolved_frequency_band_info),
+            "resolved_channel_info": _jsonable(resolved_channel_info),
+            "resolved_condition_value": _jsonable(resolved_condition_value),
+            "dataset_sfreq": _jsonable(dataset_sfreq),
+            "dataset_duration_seconds": _jsonable(dataset_duration_seconds),
+            "dataset_reference": _jsonable(dataset_reference),
+        }
+
+    evaluation_data = None
+    if evaluation_verdict is not None or evaluation_summary_csv_path:
+        evaluation_data = {
+            "evaluation_verdict": _jsonable(evaluation_verdict),
+            "evaluation_summary_csv_path": _jsonable(evaluation_summary_csv_path),
+        }
+
+    synthesis_data = None
+    if final_report_path:
+        synthesis_data = {
+            "final_report_path": _jsonable(final_report_path),
+        }
+
     return {
         "schema_version": RUN_CONTEXT_SCHEMA_VERSION,
         "run_id": run_id,
@@ -155,16 +210,23 @@ def build_run_context(
         "raw_data_path": _jsonable(raw_data_path),
         "preprocessed_data_path": _jsonable(preprocessed_data_path),
         "plan": _jsonable(plan),
+        "supervisor": supervisor_data,
         "data_prep_summary": _jsonable(data_prep_summary),
         "bad_channels_dropped": list(bad_channels_dropped or []),
         "channel_plot_paths": _jsonable(dict(channel_plot_paths or {})),
         "parameter_manifest": manifest_rows,
         "connectivity": connectivity_data,
+        "evaluation": evaluation_data,
+        "synthesis": synthesis_data,
     }
 
 
 def build_run_context_from_state(state: Mapping[str, Any]) -> Dict[str, Any]:
-    """Build a run context from the Chainlit ``completed_run_state`` dict."""
+    """Build a run context from the Chainlit ``completed_run_state`` or ``GraphState`` dict."""
+    conn = state.get("connectivity") if isinstance(state.get("connectivity"), Mapping) else {}
+    sup = state.get("supervisor") if isinstance(state.get("supervisor"), Mapping) else {}
+    ev = state.get("evaluation") if isinstance(state.get("evaluation"), Mapping) else {}
+    syn = state.get("synthesis") if isinstance(state.get("synthesis"), Mapping) else {}
     return build_run_context(
         run_id=str(state.get("run_id") or "unknown"),
         plan=state.get("plan"),
@@ -174,12 +236,26 @@ def build_run_context_from_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         raw_data_path=state.get("raw_data_path"),
         channel_plot_paths=state.get("channel_plot_paths"),
         bad_channels_dropped=state.get("bad_channels_dropped"),
-        metric_csv_paths=state.get("metric_csv_paths"),
-        heatmap_image_paths=state.get("heatmap_image_paths"),
-        network_image_paths=state.get("network_image_paths"),
-        numerical_summaries=state.get("numerical_summaries"),
-        evidence_summary=state.get("evidence_summary"),
-        consolidated_report_path=state.get("consolidated_report_path"),
+        metric_csv_paths=state.get("metric_csv_paths") or conn.get("metric_csv_paths"),
+        heatmap_image_paths=state.get("heatmap_image_paths") or conn.get("heatmap_image_paths"),
+        network_image_paths=state.get("network_image_paths") or conn.get("network_image_paths"),
+        numerical_summaries=state.get("numerical_summaries") or conn.get("numerical_summaries"),
+        evidence_summary=state.get("evidence_summary") or conn.get("evidence_summary"),
+        consolidated_report_path=state.get("consolidated_report_path") or conn.get("consolidated_report_path"),
+        user_request=state.get("user_request") or sup.get("user_request"),
+        resolved_frequency_band_info=state.get("resolved_frequency_band_info") or sup.get("resolved_frequency_band_info"),
+        resolved_channel_info=state.get("resolved_channel_info") or sup.get("resolved_channel_info"),
+        resolved_condition_value=state.get("resolved_condition_value") or sup.get("resolved_condition_value"),
+        dataset_sfreq=state.get("dataset_sfreq") if state.get("dataset_sfreq") is not None else sup.get("dataset_sfreq"),
+        dataset_duration_seconds=(
+            state.get("dataset_duration_seconds")
+            if state.get("dataset_duration_seconds") is not None
+            else sup.get("dataset_duration_seconds")
+        ),
+        dataset_reference=state.get("dataset_reference") or sup.get("dataset_reference"),
+        evaluation_verdict=state.get("evaluation_verdict") or ev.get("evaluation_verdict"),
+        evaluation_summary_csv_path=state.get("evaluation_summary_csv_path") or ev.get("evaluation_summary_csv_path"),
+        final_report_path=state.get("final_report_path") or syn.get("final_report_path"),
     )
 
 
@@ -234,6 +310,11 @@ def restore_state(context: Mapping[str, Any]) -> Dict[str, Any]:
     plan: Any = context.get("plan")
     summary: Any = context.get("data_prep_summary")
     manifest: Any = context.get("parameter_manifest") or []
+    conn: Any = context.get("connectivity") if isinstance(context.get("connectivity"), Mapping) else {}
+    sup: Any = context.get("supervisor") if isinstance(context.get("supervisor"), Mapping) else {}
+    ev: Any = context.get("evaluation") if isinstance(context.get("evaluation"), Mapping) else {}
+    syn: Any = context.get("synthesis") if isinstance(context.get("synthesis"), Mapping) else {}
+    verdict: Any = ev.get("evaluation_verdict")
     try:
         from fc_pipeline.schemas.plan import AnalysisPlan
 
@@ -248,6 +329,13 @@ def restore_state(context: Mapping[str, Any]) -> Dict[str, Any]:
             summary = DataPrepSummary(**summary)
     except Exception:
         pass
+    try:
+        from fc_pipeline.schemas.evaluation import EvaluationVerdict
+
+        if isinstance(verdict, Mapping):
+            verdict = EvaluationVerdict(**verdict)
+    except Exception:
+        pass
     return {
         "run_id": context.get("run_id"),
         "raw_data_path": context.get("raw_data_path"),
@@ -257,6 +345,22 @@ def restore_state(context: Mapping[str, Any]) -> Dict[str, Any]:
         "data_prep_summary": summary,
         "parameter_manifest": manifest,
         "plan": plan,
+        "user_request": sup.get("user_request"),
+        "resolved_frequency_band_info": sup.get("resolved_frequency_band_info"),
+        "resolved_channel_info": sup.get("resolved_channel_info"),
+        "resolved_condition_value": sup.get("resolved_condition_value"),
+        "dataset_sfreq": sup.get("dataset_sfreq"),
+        "dataset_duration_seconds": sup.get("dataset_duration_seconds"),
+        "dataset_reference": sup.get("dataset_reference"),
+        "metric_csv_paths": dict(conn.get("metric_csv_paths") or {}),
+        "heatmap_image_paths": dict(conn.get("heatmap_image_paths") or {}),
+        "network_image_paths": dict(conn.get("network_image_paths") or {}),
+        "numerical_summaries": dict(conn.get("numerical_summaries") or {}),
+        "evidence_summary": list(conn.get("evidence_summary") or []),
+        "consolidated_report_path": conn.get("consolidated_report_path"),
+        "evaluation_verdict": verdict,
+        "evaluation_summary_csv_path": ev.get("evaluation_summary_csv_path"),
+        "final_report_path": syn.get("final_report_path"),
         "informational_artifacts": {},
     }
 
@@ -295,7 +399,7 @@ def looks_like_new_analysis(text: str) -> bool:
 # Requests that want an artifact (plot/signal/comparison) are left to the
 # existing artifact handler.
 _ARTIFACT_WORDS = re.compile(
-    r"\b(plots?|graphs?|figures?|visuali[sz]\w*|psd|spectr\w*|signals?|compare|comparison|"
+    r"\b((?:data\s*)?plots?|(?:data\s*)?graphs?|figures?|visuali[sz]\w*|psd|spectr\w*|signals?|compare|comparison|"
     r"images?|pictures?)\b|before (and|vs\.?|versus) after",
     re.IGNORECASE,
 )
@@ -303,7 +407,8 @@ _ARTIFACT_WORDS = re.compile(
 _TOPICS: Dict[str, re.Pattern[str]] = {
     "summary": re.compile(
         r"\b(summary|summari[sz]e|settings|parameters?|what was done|what did you do|"
-        r"run details|details of (the )?run)\b",
+        r"run details|details of (the )?run|synthesis|final report|report results?|"
+        r"results?|findings?|conclusions?)\b",
         re.IGNORECASE,
     ),
     "run_id": re.compile(r"\b(run[ _]?id|which run)\b", re.IGNORECASE),
@@ -321,6 +426,10 @@ _TOPICS: Dict[str, re.Pattern[str]] = {
     "filter": re.compile(r"\b(filter\w*|band-?pass)\b", re.IGNORECASE),
     "dropped": re.compile(
         r"\b(bad|dropped|removed|rejected|discard\w*|excluded|flatline\w*)\b", re.IGNORECASE
+    ),
+    "evaluation": re.compile(
+        r"\b(evaluat\w*|verdict|sanity|artifact\w*|ocular|muscle|electrode pop|quality audit)\b",
+        re.IGNORECASE,
     ),
     "output": re.compile(r"\b(files?|saved|outputs?|paths?)\b", re.IGNORECASE),
 }
@@ -365,6 +474,16 @@ def _answer_channels(ctx: Mapping[str, Any]) -> Optional[str]:
         )
     else:
         out += " None were dropped, so all of them were retained."
+    sup = ctx.get("supervisor") if isinstance(ctx.get("supervisor"), Mapping) else {}
+    ch_info = sup.get("resolved_channel_info") if isinstance(sup.get("resolved_channel_info"), Mapping) else {}
+    region = ch_info.get("matched_region") or ch_info.get("region")
+    conf = ch_info.get("confidence")
+    if region:
+        out += f" Resolved from the requested `{region}` brain region" + (
+            f" (confidence {float(conf):.2f})." if isinstance(conf, (int, float)) else "."
+        )
+    elif isinstance(conf, (int, float)):
+        out += f" Resolved directly against the recording's electrode header (confidence {float(conf):.2f}) and approved at Gate 1."
     return out
 
 
@@ -377,6 +496,18 @@ def _answer_band(ctx: Mapping[str, Any]) -> Optional[str]:
     lo, hi = _get(summary, "filter_l_freq"), _get(summary, "filter_h_freq")
     if lo is not None and hi is not None:
         out += f" The signal was band-pass filtered to {_fmt_hz(lo)}-{_fmt_hz(hi)} Hz before epoching."
+    sup = ctx.get("supervisor") if isinstance(ctx.get("supervisor"), Mapping) else {}
+    b_info = sup.get("resolved_frequency_band_info") if isinstance(sup.get("resolved_frequency_band_info"), Mapping) else {}
+    sfreq = _get(summary, "sampling_frequency") or sup.get("dataset_sfreq")
+    why_parts = []
+    if b_info.get("source"):
+        why_parts.append(f"source `{b_info['source']}`")
+    if isinstance(b_info.get("confidence"), (int, float)):
+        why_parts.append(f"confidence {float(b_info['confidence']):.2f}")
+    if isinstance(sfreq, (int, float)) and sfreq > 0:
+        why_parts.append(f"valid below the Nyquist limit ({_fmt_hz(float(sfreq) / 2.0)} Hz at {_fmt_hz(sfreq)} Hz sampling rate)")
+    if why_parts:
+        out += f" **Why this band:** selected via {', '.join(why_parts)} and confirmed at Gate 1."
     return out
 
 
@@ -395,11 +526,37 @@ def _answer_metrics(ctx: Mapping[str, Any]) -> Optional[str]:
     if not p["metrics"]:
         return None
     out = f"**Requested metrics:** {', '.join(p['metrics'])}."
-    if not ctx.get("connectivity"):
+    conn = ctx.get("connectivity") if isinstance(ctx.get("connectivity"), Mapping) else None
+    if not conn:
         out += (
             " Connectivity has not been computed for this run: the pipeline currently "
             "finishes after Data Preparation, so there are no connectivity values yet."
         )
+        return out
+    summaries = conn.get("numerical_summaries") if isinstance(conn.get("numerical_summaries"), Mapping) else {}
+    if summaries:
+        stats_parts = []
+        for m, s in summaries.items():
+            if m in ("evidence_summary", "consolidated_report") or not isinstance(s, Mapping):
+                continue
+            mean_v = s.get("mean")
+            median_v = s.get("median")
+            if isinstance(mean_v, (int, float)):
+                part = f"{metric_label(m)} mean={mean_v:.4f}"
+                if isinstance(median_v, (int, float)):
+                    part += f" (median={median_v:.4f})"
+                stats_parts.append(part)
+        if stats_parts:
+            out += " **Computed summary statistics:** " + "; ".join(stats_parts) + "."
+    evidence = conn.get("evidence_summary") if isinstance(conn.get("evidence_summary"), list) else []
+    if evidence:
+        counts: Dict[str, int] = {}
+        for item in evidence:
+            cat = _get(item, "classification")
+            cat_val = str(getattr(cat, "value", cat))
+            counts[cat_val] = counts.get(cat_val, 0) + 1
+        breakdown = ", ".join(f"{k}: {v}" for k, v in counts.items())
+        out += f" **Pairwise classifications ({len(evidence)} pairs):** {breakdown}."
     return out
 
 
@@ -470,6 +627,37 @@ def _answer_output(ctx: Mapping[str, Any]) -> Optional[str]:
     return ". ".join(parts) + "."
 
 
+def _answer_evaluation(ctx: Mapping[str, Any]) -> Optional[str]:
+    ev = ctx.get("evaluation") if isinstance(ctx.get("evaluation"), Mapping) else {}
+    verdict = ev.get("evaluation_verdict") or ctx.get("evaluation_verdict")
+    if not verdict:
+        return None
+    overall = _get(verdict, "overall_verdict")
+    overall_str = str(getattr(overall, "value", overall)).upper()
+    out = f"**Evaluator Verdict:** `{overall_str}`."
+    artifacts = _get(verdict, "artifacts")
+    if artifacts:
+        oc = _get(artifacts, "ocular_contamination")
+        mu = _get(artifacts, "muscle_contamination")
+        ep = _get(artifacts, "electrode_pop")
+        art_parts = []
+        if oc is not None:
+            art_parts.append(f"ocular={'detected' if _get(oc, 'detected') else 'clear'}")
+        if mu is not None:
+            art_parts.append(f"muscle={'detected' if _get(mu, 'detected') else 'clear'}")
+        if ep is not None:
+            art_parts.append(f"electrode_pop={'detected' if _get(ep, 'detected') else 'clear'}")
+        if art_parts:
+            out += " **Artifacts:** " + ", ".join(art_parts) + "."
+    obs = _get(verdict, "visual_observations")
+    if obs:
+        out += f" **Observations:** {obs}"
+    recs = _get(verdict, "recommendations_for_user")
+    if isinstance(recs, list) and recs:
+        out += " **Recommendations:** " + " ".join(str(r) for r in recs)
+    return out
+
+
 def _answer_run_id(ctx: Mapping[str, Any]) -> Optional[str]:
     return f"**Run id:** `{ctx.get('run_id')}`" if ctx.get("run_id") else None
 
@@ -481,6 +669,7 @@ def _answer_summary(ctx: Mapping[str, Any]) -> Optional[str]:
         _answer_channels(ctx),
         _answer_condition(ctx),
         _answer_metrics(ctx),
+        _answer_evaluation(ctx),
         _answer_reference(ctx),
         _answer_epochs(ctx),
         _answer_sampling(ctx),
@@ -501,6 +690,7 @@ _ANSWERERS = {
     "sampling": _answer_sampling,
     "filter": _answer_filter,
     "dropped": _answer_dropped,
+    "evaluation": _answer_evaluation,
     "output": _answer_output,
 }
 

@@ -48,7 +48,7 @@ library that may not be installed.
 DEFAULT_CONTEXT_TOKEN_BUDGET: int = DEFAULT_CONTEXT_TOKEN_WINDOW
 
 _ARTIFACT_WORDS = re.compile(
-    r"\b(plots?|graphs?|figures?|visuali[sz]\w*|psd|spectr\w*|signals?|compare|comparison|"
+    r"\b((?:data\s*)?plots?|(?:data\s*)?graphs?|figures?|visuali[sz]\w*|psd|spectr\w*|signals?|compare|comparison|"
     r"images?|pictures?|heatmap|network|before\s+(and|vs\.?|versus)\s+after)\b",
     re.IGNORECASE,
 )
@@ -184,15 +184,19 @@ class PostRunContextWindowManager:
         band = plan.get("freq_band") if isinstance(plan, Mapping) else {}
         dp = ctx.get("data_prep_summary") or {}
         manifest = ctx.get("parameter_manifest") or []
+        sup = ctx.get("supervisor") if isinstance(ctx.get("supervisor"), Mapping) else {}
+        b_info = sup.get("resolved_frequency_band_info") if isinstance(sup.get("resolved_frequency_band_info"), Mapping) else {}
+        ch_info = sup.get("resolved_channel_info") if isinstance(sup.get("resolved_channel_info"), Mapping) else {}
 
         reg["run_plan_summary"] = textwrap.dedent(
             f"""
             # Run Plan
 
             - run_id: {ctx.get("run_id", "unknown")}
-            - Frequency band: {band.get("name", "?")} {band.get("fmin", "?")}-{band.get("fmax", "?")} Hz
+            - User request: {sup.get("user_request") or "not recorded"}
+            - Frequency band: {band.get("name", "?")} {band.get("fmin", "?")}-{band.get("fmax", "?")} Hz (source: {b_info.get("source", "canonical")}, confidence: {b_info.get("confidence", 1.0)})
             - Condition: {plan.get("condition", "?")}
-            - Channels ({len(plan.get("channels") or [])}): {", ".join(str(c) for c in (plan.get("channels") or []))}
+            - Channels ({len(plan.get("channels") or [])}): {", ".join(str(c) for c in (plan.get("channels") or []))} (region: {ch_info.get("matched_region") or ch_info.get("region") or "explicit"}, confidence: {ch_info.get("confidence", 1.0)})
             - Metrics: {", ".join(str(m) for m in (plan.get("metrics") or []))}
             """
         ).strip()
@@ -233,17 +237,42 @@ class PostRunContextWindowManager:
                 + json.dumps(connectivity, indent=2, ensure_ascii=False, default=str)
             )
 
-        # Before / after plot metadata (NOT the binary PNGs — those stay on disk)
-        plots = ctx.get("channel_plot_paths") or {}
-        reg["plot_index"] = textwrap.dedent(
-            f"""
-            # Available Plots
+        evaluation = ctx.get("evaluation")
+        if evaluation:
+            reg["evaluation_summary"] = (
+                "# Evaluator Stage Summary (Node 4)\n"
+                + json.dumps(evaluation, indent=2, ensure_ascii=False, default=str)
+            )
 
-            - channels_before: {plots.get("before", "not generated")}
-            - channels_after:  {plots.get("after", "not generated")}
-            - preprocessed epochs file: {ctx.get("preprocessed_data_path", "none")}
-            """
-        ).strip()
+        synthesis = ctx.get("synthesis")
+        if synthesis:
+            reg["synthesis_summary"] = (
+                "# Final Synthesis Stage Summary (Node 5)\n"
+                + json.dumps(synthesis, indent=2, ensure_ascii=False, default=str)
+            )
+
+        # Before / after & diagnostic plot metadata (NOT the binary PNGs — those stay on disk)
+        plots = ctx.get("channel_plot_paths") or {}
+        conn_heatmaps = (connectivity.get("heatmap_image_paths") if isinstance(connectivity, Mapping) else None) or {}
+        conn_networks = (connectivity.get("network_image_paths") if isinstance(connectivity, Mapping) else None) or {}
+        plot_lines = [
+            "# Available Plots",
+            "",
+            f"- channels_before: {plots.get('channels_before') or plots.get('before', 'not generated')} (raw EEG traces before preprocessing)",
+            f"- channels_after:  {plots.get('channels_after') or plots.get('after', 'not generated')} (clean epoched EEG traces after filtering & referencing)",
+            f"- channel_variance: {plots.get('channel_variance', 'not generated')} (bar chart of per-channel variance across epochs for bad-channel screening)",
+            f"- psd_overview: {plots.get('psd_overview', 'not generated')} (Welch power spectral density across retained channels highlighting the selected band)",
+            f"- preprocessed epochs file: {ctx.get('preprocessed_data_path', 'none')}",
+        ]
+        if conn_heatmaps:
+            plot_lines.append(
+                "- connectivity_heatmaps: " + ", ".join(f"{k}={v}" for k, v in conn_heatmaps.items())
+            )
+        if conn_networks:
+            plot_lines.append(
+                "- connectivity_networks: " + ", ".join(f"{k}={v}" for k, v in conn_networks.items())
+            )
+        reg["plot_index"] = "\n".join(plot_lines).strip()
 
         return reg
 
@@ -326,7 +355,7 @@ class PostRunContextWindowManager:
     # ------------------------------------------------------------------
 
     _TOPIC_OFFLOAD_MAP: Dict[str, List[str]] = {
-        "summary": ["run_plan_summary", "data_prep_details", "manifest_elevated_risk"],
+        "summary": ["run_plan_summary", "data_prep_details", "manifest_elevated_risk", "evaluation_summary"],
         "run_id": ["run_plan_summary"],
         "channels": ["run_plan_summary", "data_prep_details"],
         "band": ["run_plan_summary"],
@@ -337,7 +366,8 @@ class PostRunContextWindowManager:
         "sampling": ["data_prep_details"],
         "filter": ["data_prep_details"],
         "dropped": ["data_prep_details"],
-        "output": ["data_prep_details", "plot_index"],
+        "evaluation": ["evaluation_summary", "synthesis_summary", "run_plan_summary"],
+        "output": ["data_prep_details", "plot_index", "synthesis_summary"],
     }
 
     def _select_offload_keys_for_query(self, query: str, intent: str) -> List[str]:
@@ -349,6 +379,8 @@ class PostRunContextWindowManager:
         if intent == "plot_interpreter":
             keys.append("plot_index")
             keys.append("data_prep_details")
+            keys.append("run_plan_summary")
+            keys.append("connectivity_summary")
         elif intent == "new_analysis":
             # New analysis only needs the plan for context of what was already
             # done — do NOT dump elevated risk or data prep details.
@@ -358,13 +390,15 @@ class PostRunContextWindowManager:
             if "summary" in matched:
                 matched = ["summary"]
             if not matched:
-                # Catch-all: bring in the short plan summary for free so the
-                # agent has a skeleton answer if the user asks something that
-                # the topic detector missed.
+                # Catch-all: bring in the short plan summary (and data prep if asking why/explain)
                 keys.append("run_plan_summary")
+                if re.search(r"\b(why|explain|reason|setup|set up|result|results)\b", query, re.I):
+                    keys.extend(["data_prep_details", "connectivity_summary"])
             else:
                 for name in matched:
                     keys.extend(self._TOPIC_OFFLOAD_MAP.get(name, ["run_plan_summary"]))
+                if re.search(r"\b(why|explain|reason)\b", query, re.I):
+                    keys.extend(["run_plan_summary", "data_prep_details"])
 
         seen = set()
         ordered: List[str] = []

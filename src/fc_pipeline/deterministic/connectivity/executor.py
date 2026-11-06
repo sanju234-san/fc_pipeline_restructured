@@ -124,7 +124,10 @@ def run_connectivity_analysis(
     try:
         # 1. Load preprocessed epoched data
         logger.info("Loading preprocessed epochs from %s", fif_path)
-        epochs = mne.read_epochs(fif_path, preload=True, verbose=False)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            epochs = mne.read_epochs(fif_path, preload=True, verbose=False)
 
         # 2. Match requested channels
         plan_channels = connectivity_input.plan.channels

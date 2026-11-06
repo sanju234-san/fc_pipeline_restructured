@@ -122,10 +122,7 @@ def _evaluate_rail(
     # blocked, or the rail itself failed to run (fail closed)
     if status == "blocked":
         if rail_type == "input":
-            reason = (
-                "The input guardrail flagged this message as a possible "
-                "jailbreak / prompt-injection attempt, or as unrelated to EEG analysis."
-            )
+            reason = "Cannot process this query."
             title = "Guardrail Review — Input Screening"
         else:
             reason = (

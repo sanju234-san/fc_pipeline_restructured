@@ -120,8 +120,8 @@ async def launch_eeg_viewer(
     try:
         import PyQt5  # noqa: F401
     except ImportError:
-        logger.warning(
-            "EEG Viewer cannot start — PyQt5 not installed. Run: pip install PyQt5>=5.15"
+        logger.debug(
+            "EEG Viewer desktop pop-out skipped — PyQt5 not installed."
         )
         return ViewerLaunchResult(
             ok=False, mode="failed",

@@ -23,7 +23,9 @@ from fc_pipeline.pipeline.nodes import (
     apply_output_rail,
     connectivity_node_adapter,
     data_prep_node_adapter,
+    evaluator_node_adapter,
     supervisor_node_adapter,
+    synthesis_node_adapter,
     query_transformer_node_adapter,
 )
 
@@ -167,6 +169,24 @@ def route_data_prep_output(state: GraphState) -> str:
         return END
     if state.get("preprocessed_data_path"):
         return "connectivity_analysis"
+    return END
+
+
+def route_connectivity_output(state: GraphState) -> str:
+    """Evaluates Connectivity Analysis (Node 3) output to determine next pipeline step."""
+    if state.get("pipeline_error"):
+        return END
+    if state.get("metric_csv_paths"):
+        return "evaluator"
+    return END
+
+
+def route_evaluator_output(state: GraphState) -> str:
+    """Evaluates Evaluator (Node 4) output to determine next pipeline step."""
+    if state.get("pipeline_error"):
+        return END
+    if state.get("evaluation_verdict") is not None:
+        return "synthesis"
     return END
 
 
@@ -342,6 +362,8 @@ def build_pipeline_graph() -> StateGraph:
     graph.add_node("gate_1_review", gate_1_review)
     graph.add_node("data_prep", data_prep_node_adapter)
     graph.add_node("connectivity_analysis", connectivity_node_adapter)
+    graph.add_node("evaluator", evaluator_node_adapter)
+    graph.add_node("synthesis", synthesis_node_adapter)
     graph.add_node("informational_complete", informational_complete)
     graph.add_node("clarification_pause", clarification_pause)
     graph.add_node("supervisor_error", supervisor_error)
@@ -405,8 +427,28 @@ def build_pipeline_graph() -> StateGraph:
         },
     )
 
-    # Connectivity Analysis terminal edge (or downstream Evaluator in future Node 4)
-    graph.add_edge("connectivity_analysis", END)
+    # Connectivity Analysis conditional routing to Evaluator (Node 4) or END
+    graph.add_conditional_edges(
+        "connectivity_analysis",
+        route_connectivity_output,
+        {
+            "evaluator": "evaluator",
+            END: END,
+        },
+    )
+
+    # Evaluator conditional routing to Final Synthesis (Node 5) or END
+    graph.add_conditional_edges(
+        "evaluator",
+        route_evaluator_output,
+        {
+            "synthesis": "synthesis",
+            END: END,
+        },
+    )
+
+    # Final Synthesis terminal edge
+    graph.add_edge("synthesis", END)
 
     graph.add_conditional_edges(
         "clarification_pause",
