@@ -1266,6 +1266,9 @@ async def on_message(message: cl.Message):
     if await _try_memory_command(user_text):
         return
 
+    if await _try_batch_mcp_command(message, user_text):
+        return
+
     # A completed run is intentionally read-only for ordinary follow-ups.
     # Do this before any query transformation/pipeline invocation so a user
     # asking for a plot or summary cannot accidentally restart Supervisor/Data Prep.
@@ -3658,3 +3661,277 @@ async def _handle_pipeline_output(
     cl.user_session.set("awaiting_clarification", False)
     msg.content = "\n".join(fallback)
     await msg.update()
+
+
+# ---------------------------------------------------------------------------
+# Multi-Dataset Parallel Batch Support (via internal FastMCP server)
+# ---------------------------------------------------------------------------
+
+
+async def _prepare_batch_job(idx: int, path: Path, query: str, ts: str):
+    """Discover dataset header/conditions/band/channels via MCP and build a DatasetJob."""
+    from fc_pipeline.mcp_server.client import call_mcp_tool
+    from fc_pipeline.mcp_server.orchestrator import DatasetJob
+    from fc_pipeline.schemas.manifest import ParameterManifestEntry
+    from fc_pipeline.schemas.plan import AnalysisPlan, FrequencyBand
+
+    run_id = f"batch_{ts}_{idx:02d}"
+    info = await call_mcp_tool("get_dataset_info", {"data_path": str(path)})
+    cond_info = await call_mcp_tool("get_dataset_conditions", {"data_path": str(path)})
+    sfreq = float(info.get("sfreq") or 160.0)
+    dur = float(info.get("duration_seconds") or 10.0)
+    avail_chs = list(info.get("available_channels") or [])
+
+    band_word = next(
+        (b for b in ("delta", "theta", "alpha", "beta", "gamma") if b in query.lower()),
+        "alpha",
+    )
+    band = await call_mcp_tool(
+        "resolve_frequency_band",
+        {"band_name_or_range": band_word, "sfreq": sfreq, "duration_seconds": dur},
+    )
+    ch_res = await call_mcp_tool(
+        "resolve_channel_selection",
+        {"requested_channels_or_region": query or "frontal", "available_channels": avail_chs},
+    )
+    selected_chs = list(ch_res.get("resolved_channels") or avail_chs[: min(6, len(avail_chs))])
+
+    conds = list(cond_info.get("conditions") or [])
+    matched_cond = next((c for c in conds if c.lower() in query.lower()), conds[0] if conds else "T0")
+
+    band_name = str(band.get("name") or band_word)
+    fmin_v = float(band.get("fmin") or 8.0)
+    fmax_v = float(band.get("fmax") or 12.0)
+
+    plan = AnalysisPlan(
+        metrics=["pli", "wpli", "imcoh", "plv", "coh"],
+        freq_band=FrequencyBand(
+            name=band_name,
+            fmin=fmin_v,
+            fmax=fmax_v,
+        ),
+        channels=selected_chs,
+        condition=str(matched_cond),
+    )
+    manifest = [
+        ParameterManifestEntry(
+            name="freq_band",
+            category="frequency_band",
+            proposed_value=f"{band_name} ({fmin_v}-{fmax_v} Hz)",
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="low",
+            human_approved_value=f"{band_name} ({fmin_v}-{fmax_v} Hz)",
+            rationale="Resolved frequency band",
+        ),
+        ParameterManifestEntry(
+            name="channels",
+            category="channels",
+            proposed_value=", ".join(selected_chs),
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="low",
+            human_approved_value=", ".join(selected_chs),
+            rationale="Resolved channels",
+        ),
+        ParameterManifestEntry(
+            name="condition",
+            category="condition",
+            proposed_value=str(matched_cond),
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="low",
+            human_approved_value=str(matched_cond),
+            rationale="Dataset condition",
+        ),
+        ParameterManifestEntry(
+            name="reference",
+            category="preprocessing",
+            proposed_value=str(info.get("reference") or "average"),
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="elevated",
+            human_approved_value="average",
+            rationale="Common Average Reference (CAR)",
+        ),
+        ParameterManifestEntry(
+            name="bad_channel_variance_threshold",
+            category="preprocessing",
+            proposed_value="1e-15",
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="elevated",
+            human_approved_value="1e-15",
+            rationale="Flatline variance threshold",
+        ),
+        ParameterManifestEntry(
+            name="min_cycles",
+            category="preprocessing",
+            proposed_value="3",
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="elevated",
+            human_approved_value="3",
+            rationale="Minimum cycles",
+        ),
+        ParameterManifestEntry(
+            name="tau_phase",
+            category="coupling_threshold",
+            proposed_value="0.20",
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="elevated",
+            human_approved_value="0.20",
+            rationale="Default phase threshold",
+        ),
+        ParameterManifestEntry(
+            name="tau_zerolag",
+            category="coupling_threshold",
+            proposed_value="0.35",
+            confidence=1.0,
+            needs_human_input=False,
+            risk_tier="elevated",
+            human_approved_value="0.35",
+            rationale="Default zero-lag threshold",
+        ),
+    ]
+    return DatasetJob(
+        run_id=run_id,
+        raw_data_path=str(path),
+        user_request=query,
+        plan=plan.model_dump(mode="json"),
+        parameter_manifest=[m.model_dump(mode="json") for m in manifest],
+        gate_1_approved=False,
+    )
+
+
+async def _send_batch_result_card(res: Dict[str, Any]) -> None:
+    run_id = res["run_id"]
+    if res.get("status") == "completed" and res.get("final_report_path"):
+        report_p = res["final_report_path"]
+        actions = [
+            cl.Action(name="preview_file", payload={"path": report_p}, label=f"👁️ Preview {run_id}"),
+            cl.Action(
+                name="batch_select_run",
+                payload={"run_context_path": res.get("run_context_path") or "", "run_id": run_id},
+                label=f"💬 Ask about {run_id}",
+            ),
+        ]
+        await cl.Message(
+            content=f"✅ **`{run_id}` completed** — `{Path(report_p).name}`",
+            actions=actions,
+        ).send()
+    else:
+        await cl.Message(
+            content=f"❌ **`{run_id}` failed** (`{res.get('stage', 'unknown')}`): {mask_text(str(res.get('error') or 'Unknown error'))}"
+        ).send()
+
+
+async def _try_batch_mcp_command(message: cl.Message, user_text: str) -> bool:
+    """Handle `/batch <path1>, <path2> | <query>` or messages with 2+ EEG file attachments."""
+    elements = [
+        el for el in (getattr(message, "elements", None) or [])
+        if getattr(el, "path", None) and Path(str(el.path)).suffix.lower() in {".fif", ".edf", ".zip"}
+    ]
+    is_batch_cmd = user_text.lower().lstrip().startswith("/batch")
+    if not is_batch_cmd and len(elements) < 2:
+        return False
+
+    paths: List[Path] = []
+    query = user_text
+    if is_batch_cmd:
+        body = re.sub(r"^/\s*batch\s*", "", user_text, flags=re.IGNORECASE).strip()
+        if "|" in body:
+            paths_part, query = [x.strip() for x in body.split("|", 1)]
+        else:
+            paths_part, query = body, "alpha frontal connectivity"
+        for raw_p in [p.strip().strip('"').strip("'") for p in paths_part.split(",") if p.strip()]:
+            cand = Path(raw_p).resolve()
+            ok, reason = await cl.make_async(_validate_dataset_path)(cand)
+            if not ok:
+                await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
+                return True
+            paths.append(cand)
+    for el in elements:
+        cand = await cl.make_async(_dataset_from_upload)(el)
+        ok, reason = await cl.make_async(_validate_dataset_path)(cand)
+        if not ok:
+            await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
+            return True
+        paths.append(cand.resolve())
+
+    if len(paths) < 2:
+        await cl.Message(
+            content="ℹ️ Provide at least 2 `.fif`/`.edf` files (e.g. `/batch file1.edf, file2.edf | alpha frontal connectivity` or attach 2+ files)."
+        ).send()
+        return True
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    jobs = await asyncio.gather(*(_prepare_batch_job(i + 1, p, query, ts) for i, p in enumerate(paths)))
+    batch_store = cl.user_session.get("batch_jobs") or {}
+    for job in jobs:
+        batch_store[job.run_id] = job
+        plan = job.plan or {}
+        band = plan.get("freq_band") or {}
+        actions = [
+            cl.Action(name="batch_approve_gate1", payload={"run_id": job.run_id}, label=f"✅ Approve {job.run_id}"),
+            cl.Action(name="batch_reject_gate1", payload={"run_id": job.run_id}, label=f"✖ Reject {job.run_id}"),
+        ]
+        await cl.Message(
+            content=(
+                f"⏸️ **Gate 1 Pending — `{job.run_id}`** (`{Path(job.raw_data_path).name}`)\n"
+                f"- Band: `{band.get('name')} ({band.get('fmin')}–{band.get('fmax')} Hz)` | "
+                f"Channels: `{len(plan.get('channels') or [])}` | Condition: `{plan.get('condition')}`\n"
+                f"_Approving one dataset runs it immediately without blocking the others._"
+            ),
+            actions=actions,
+        ).send()
+    cl.user_session.set("batch_jobs", batch_store)
+    return True
+
+
+@cl.action_callback("batch_approve_gate1")
+async def _on_batch_approve_gate1(action: cl.Action):
+    from fc_pipeline.mcp_server.orchestrator import run_single_dataset_via_mcp
+
+    run_id = str((action.payload or {}).get("run_id") or "")
+    batch_store = cl.user_session.get("batch_jobs") or {}
+    job = batch_store.get(run_id)
+    if job is None:
+        await cl.Message(content=f"⚠️ Batch job `{run_id}` not found in session.").send()
+        return
+    job.gate_1_approved = True
+    status_msg = cl.Message(content=f"🚀 Running **`{run_id}`** via internal MCP worker pool…")
+    await status_msg.send()
+    res = await run_single_dataset_via_mcp(job, use_llm=False)
+    await status_msg.remove()
+    await _send_batch_result_card(res)
+
+
+@cl.action_callback("batch_reject_gate1")
+async def _on_batch_reject_gate1(action: cl.Action):
+    run_id = str((action.payload or {}).get("run_id") or "")
+    batch_store = cl.user_session.get("batch_jobs") or {}
+    batch_store.pop(run_id, None)
+    cl.user_session.set("batch_jobs", batch_store)
+    await cl.Message(content=f"🛑 Cancelled **`{run_id}`** at Gate 1.").send()
+
+
+@cl.action_callback("batch_select_run")
+async def _on_batch_select_run(action: cl.Action):
+    from fc_pipeline.pipeline.run_context import load_run_context, restore_state
+
+    payload = action.payload or {}
+    ctx_path = Path(str(payload.get("run_context_path") or ""))
+    run_id = str(payload.get("run_id") or "")
+    ctx = load_run_context(ctx_path) if ctx_path.is_file() else None
+    if not ctx:
+        await cl.Message(content=f"⚠️ Run context for `{run_id}` is unavailable.").send()
+        return
+    restored = restore_state(ctx)
+    cl.user_session.set("completed_run_active", True)
+    cl.user_session.set("completed_run_state", restored)
+    cl.user_session.set("last_data_prep_run_id", run_id)
+    await cl.Message(
+        content=f"💬 Switched read-only follow-up context to **`{run_id}`**. Ask any question about this run's results."
+    ).send()

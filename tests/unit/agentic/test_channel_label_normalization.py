@@ -6,7 +6,9 @@ import types
 # This test file is intentionally dependency-light.  The project normally uses
 # langchain_core.tools.tool; provide a tiny decorator fallback for this focused
 # normalization test when the full LangChain stack is not installed.
-if "langchain_core.tools" not in sys.modules:
+try:
+    import langchain_core.tools  # noqa: F401
+except ImportError:
     lc = types.ModuleType("langchain_core")
     tools = types.ModuleType("langchain_core.tools")
     tools.tool = lambda fn: fn

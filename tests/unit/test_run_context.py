@@ -155,10 +155,54 @@ def test_few_epochs_are_flagged_as_unreliable(state):
         "Compare C3 and C4",
         "show the dataset before and after Data Prep",
         "explain the plots",
+        "explain the dataplots",
     ],
 )
 def test_artifact_requests_are_left_to_the_plot_handler(ctx, request_text):
     assert answer_run_question(request_text, ctx) is None
+
+
+def test_supervisor_and_connectivity_context_roundtrip_and_grounding(state):
+    state["user_request"] = "Analyze alpha connectivity in motor channels"
+    state["resolved_frequency_band_info"] = {
+        "name": "alpha",
+        "fmin": 8.0,
+        "fmax": 13.0,
+        "source": "user_explicit",
+        "confidence": 0.95,
+        "nyquist_ok": True,
+    }
+    state["resolved_channel_info"] = {
+        "resolved_channels": ["C3..", "C4..", "Cz.."],
+        "source": "region_keyword",
+        "confidence": 0.90,
+        "matched_region": "central / motor",
+    }
+    state["dataset_sfreq"] = 160.0
+    state["heatmap_image_paths"] = {"pli": "outputs/plots/heatmap_pli.png"}
+    state["network_image_paths"] = {"pli": "outputs/plots/network_pli.png"}
+    state["numerical_summaries"] = {"pli": {"mean": 0.24, "max": 0.41}}
+
+    rich_ctx = build_run_context_from_state(state)
+    assert rich_ctx["supervisor"]["dataset_sfreq"] == 160.0
+    assert rich_ctx["connectivity"]["heatmap_image_paths"] == {"pli": "outputs/plots/heatmap_pli.png"}
+
+    band_ans = answer_run_question("why this band?", rich_ctx)
+    assert "4-8 Hz" in band_ans
+    assert "user_explicit" in band_ans
+    assert "Nyquist limit (80 Hz at 160 Hz sampling rate)" in band_ans
+
+    ch_ans = answer_run_question("which channels were selected?", rich_ctx)
+    assert "central / motor" in ch_ans
+    assert "confidence 0.90" in ch_ans
+
+    metric_ans = answer_run_question("what were the connectivity metrics?", rich_ctx)
+    assert "mean=0.240" in metric_ans
+
+    restored = restore_state(rich_ctx)
+    assert restored["resolved_frequency_band_info"]["name"] == "alpha"
+    assert restored["heatmap_image_paths"] == {"pli": "outputs/plots/heatmap_pli.png"}
+    assert restored["numerical_summaries"] == {"pli": {"mean": 0.24, "max": 0.41}}
 
 
 def test_unrelated_text_and_missing_data_return_none(ctx):

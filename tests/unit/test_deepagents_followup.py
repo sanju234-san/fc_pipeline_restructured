@@ -321,3 +321,28 @@ def test_run_followup_harness_unavailable_graceful_fallback(manager, monkeypatch
     assert "deepagents" in str(result.error).lower() or "forced" in str(result.error).lower()
     # assistant_text is non-empty and user-facing (mentions plots or fallback)
     assert len(result.assistant_text.strip()) > 0
+
+
+def test_explain_dataplots_routes_to_plot_interpreter_and_indexes_all_plots(sample_run_context):
+    sample_run_context["plots"] = {
+        "channels_before": "outputs/plots/channels_before.png",
+        "channels_after": "outputs/plots/channels_after.png",
+        "channel_variance": "outputs/plots/channel_variance.png",
+        "psd_overview": "outputs/plots/psd_overview.png",
+    }
+    sample_run_context["connectivity"] = {
+        "heatmap_image_paths": {"wpli": "outputs/plots/heatmap_wpli.png"},
+        "network_image_paths": {"wpli": "outputs/plots/network_wpli.png"},
+        "numerical_summaries": {"wpli": {"mean": 0.31, "max": 0.52}},
+        "evidence_summary": [],
+    }
+    mgr = PostRunContextWindowManager(sample_run_context)
+    assert mgr.route_intent("explain the dataplots") == "plot_interpreter"
+    selection = mgr.prepare_for_query("explain the dataplots")
+    assert "plot_index" in selection.system_prompt_fragment
+    assert "run_plan_summary" in selection.system_prompt_fragment
+    assert "connectivity_summary" in selection.system_prompt_fragment
+    assert "channels_before" in selection.system_prompt_fragment
+    assert "psd_overview" in selection.system_prompt_fragment
+    assert "heatmap_wpli.png" in selection.system_prompt_fragment
+    assert "network_wpli.png" in selection.system_prompt_fragment

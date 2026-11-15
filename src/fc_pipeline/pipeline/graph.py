@@ -465,8 +465,27 @@ def build_pipeline_graph() -> StateGraph:
     return graph
 
 
-def compile_pipeline_app(checkpointer: Optional[Any] = None):
-    """Compiles the pipeline StateGraph with a checkpointer (defaults to MemorySaver)."""
+def compile_pipeline_app(
+    checkpointer: Optional[Any] = None,
+    *,
+    sqlite_path: Optional[str] = None,
+):
+    """Compiles the pipeline StateGraph with a checkpointer (SqliteSaver if path/env set, else MemorySaver)."""
     if checkpointer is None:
-        checkpointer = MemorySaver()
+        import os
+
+        db_path = sqlite_path or os.getenv("FC_CHECKPOINT_DB")
+        if db_path:
+            try:
+                import sqlite3
+                from pathlib import Path
+                from langgraph.checkpoint.sqlite import SqliteSaver
+
+                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(db_path), check_same_thread=False)
+                checkpointer = SqliteSaver(conn)
+            except Exception:
+                checkpointer = MemorySaver()
+        else:
+            checkpointer = MemorySaver()
     return build_pipeline_graph().compile(checkpointer=checkpointer)

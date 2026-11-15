@@ -212,3 +212,16 @@ def test_data_prep_to_connectivity_dag(synthetic_raw_dataset, tmp_path: Path):
         assert item.classification is not None
         assert 0.0 <= item.phase_robust_mean <= 1.0
         assert 0.0 <= item.zero_lag_mean <= 1.0
+
+    # 5. Verify Evaluator outputs (Node 4)
+    eval_verdict = after_state.values.get("evaluation_verdict")
+    assert eval_verdict is not None
+    assert "pli" in eval_verdict.per_metric_sanity
+    eval_csv = after_state.values.get("evaluation_summary_csv_path")
+    assert eval_csv is not None
+    assert Path(eval_csv).exists()
+
+    # 6. Verify Final Synthesis outputs (Node 5)
+    final_report = after_state.values.get("final_report_path")
+    assert final_report is not None
+    assert Path(final_report).exists()
