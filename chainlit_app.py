@@ -307,25 +307,30 @@ async def _prompt_for_dataset() -> tuple[Path, bool, str]:
         name = choice.get("name") if isinstance(choice, dict) else getattr(choice, "name", None)
         if name == "upload":
             files = await cl.AskFileMessage(
-                content="Upload one `.fif`, `.edf`, or `.zip` EEG dataset.",
+                content="Upload 1 to 5 `.fif`, `.edf`, or `.zip` EEG dataset(s).",
                 accept={
                     "application/octet-stream": [".fif", ".edf"],
                     "application/zip": [".zip"],
                 },
                 max_size_mb=1000,
-                max_files=1,
+                max_files=5,
                 timeout=300,
             ).send()
             if not files:
                 await cl.Message(content="⚠️ No dataset was uploaded. Please choose an input method again.").send()
                 continue
             try:
-                path = await cl.make_async(_dataset_from_upload)(files[0])
-                ok, reason = await cl.make_async(_validate_dataset_path)(path)
-                if not ok:
-                    raise ValueError(reason)
+                validated: List[Path] = []
+                for f in files:
+                    path = await cl.make_async(_dataset_from_upload)(f)
+                    ok, reason = await cl.make_async(_validate_dataset_path)(path)
+                    if not ok:
+                        raise ValueError(reason)
+                    validated.append(path.resolve())
                 query = await _prompt_for_analysis_query()
-                return path.resolve(), True, query
+                if len(validated) > 1:
+                    cl.user_session.set("startup_batch_paths", validated)
+                return validated[0], True, query
             except Exception as exc:
                 await cl.Message(content=f"❌ Dataset rejected: {mask_text(str(exc))}").send()
                 continue
@@ -333,8 +338,8 @@ async def _prompt_for_dataset() -> tuple[Path, bool, str]:
         if name == "url":
             url_reply = await cl.AskUserMessage(
                 content=(
-                    "Paste the dataset URL. It may point directly to `.fif`, `.edf`, or `.zip`; "
-                    "the URL does not have to end with the file extension."
+                    "Paste 1 or more dataset URLs (one per line or comma-separated). "
+                    "Each may point directly to `.fif`, `.edf`, or `.zip`."
                 ),
                 timeout=300,
             ).send()
@@ -346,14 +351,20 @@ async def _prompt_for_dataset() -> tuple[Path, bool, str]:
             if not url:
                 await cl.Message(content="⚠️ No URL was provided. Please try again.").send()
                 continue
+            urls = [u.strip() for u in re.split(r"[\n,]+", url) if u.strip()]
             try:
-                await cl.Message(content="⏳ Downloading dataset from URL...").send()
-                path = await cl.make_async(_download_dataset_url)(url)
-                ok, reason = await cl.make_async(_validate_dataset_path)(path)
-                if not ok:
-                    raise ValueError(reason)
+                await cl.Message(content=f"⏳ Downloading {len(urls)} dataset(s) from URL...").send()
+                validated_urls: List[Path] = []
+                for u in urls:
+                    path = await cl.make_async(_download_dataset_url)(u)
+                    ok, reason = await cl.make_async(_validate_dataset_path)(path)
+                    if not ok:
+                        raise ValueError(reason)
+                    validated_urls.append(path.resolve())
                 query = await _prompt_for_analysis_query()
-                return path.resolve(), True, query
+                if len(validated_urls) > 1:
+                    cl.user_session.set("startup_batch_paths", validated_urls)
+                return validated_urls[0], True, query
             except Exception as exc:
                 await cl.Message(
                     content=(
@@ -875,6 +886,12 @@ async def on_chat_start():
     }
     for k, v in session_state.items():
         cl.user_session.set(k, v)
+
+    startup_batch = cl.user_session.get("startup_batch_paths")
+    if startup_batch and len(startup_batch) > 1:
+        cl.user_session.set("startup_batch_paths", None)
+        await _launch_batch_jobs(startup_batch, user_query)
+        return
 
     # Deliberately do not show a Dataset Overview here. Metadata is available
     # to the Supervisor tools; the chat should proceed directly into analysis.
@@ -3682,17 +3699,23 @@ async def _prepare_batch_job(idx: int, path: Path, query: str, ts: str):
     dur = float(info.get("duration_seconds") or 10.0)
     avail_chs = list(info.get("available_channels") or [])
 
-    band_word = next(
-        (b for b in ("delta", "theta", "alpha", "beta", "gamma") if b in query.lower()),
-        "alpha",
+    hz_match = re.search(r"\b(\d+(?:\.\d+)?\s*(?:-|to)\s*\d+(?:\.\d+)?\s*hz)\b", query.lower())
+    band_word = (
+        hz_match.group(1)
+        if hz_match
+        else next(
+            (b for b in ("delta", "theta", "alpha", "beta", "gamma") if b in query.lower()),
+            "alpha",
+        )
     )
     band = await call_mcp_tool(
         "resolve_frequency_band",
         {"band_name_or_range": band_word, "sfreq": sfreq, "duration_seconds": dur},
     )
+    ch_query = "all" if re.search(r"\ball\s+channels?\b", query.lower()) else query
     ch_res = await call_mcp_tool(
         "resolve_channel_selection",
-        {"requested_channels_or_region": query or "frontal", "available_channels": avail_chs},
+        {"requested_channels_or_region": ch_query or "frontal", "available_channels": avail_chs},
     )
     selected_chs = list(ch_res.get("resolved_channels") or avail_chs[: min(6, len(avail_chs))])
 
@@ -3827,45 +3850,63 @@ async def _send_batch_result_card(res: Dict[str, Any]) -> None:
         ).send()
 
 
-async def _try_batch_mcp_command(message: cl.Message, user_text: str) -> bool:
-    """Handle `/batch <path1>, <path2> | <query>` or messages with 2+ EEG file attachments."""
-    elements = [
-        el for el in (getattr(message, "elements", None) or [])
-        if getattr(el, "path", None) and Path(str(el.path)).suffix.lower() in {".fif", ".edf", ".zip"}
-    ]
-    is_batch_cmd = user_text.lower().lstrip().startswith("/batch")
-    if not is_batch_cmd and len(elements) < 2:
-        return False
+async def _prompt_missing_batch_axes(first_path: Path, query: str) -> str:
+    """Ask once for any missing scientific axes (band, channels, condition) before Gate 1."""
+    from fc_pipeline.mcp_server.client import call_mcp_tool
 
-    paths: List[Path] = []
-    query = user_text
-    if is_batch_cmd:
-        body = re.sub(r"^/\s*batch\s*", "", user_text, flags=re.IGNORECASE).strip()
-        if "|" in body:
-            paths_part, query = [x.strip() for x in body.split("|", 1)]
-        else:
-            paths_part, query = body, "alpha frontal connectivity"
-        for raw_p in [p.strip().strip('"').strip("'") for p in paths_part.split(",") if p.strip()]:
-            cand = Path(raw_p).resolve()
-            ok, reason = await cl.make_async(_validate_dataset_path)(cand)
-            if not ok:
-                await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
-                return True
-            paths.append(cand)
-    for el in elements:
-        cand = await cl.make_async(_dataset_from_upload)(el)
-        ok, reason = await cl.make_async(_validate_dataset_path)(cand)
-        if not ok:
-            await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
-            return True
-        paths.append(cand.resolve())
+    info = await call_mcp_tool("get_dataset_info", {"data_path": str(first_path)})
+    cond_info = await call_mcp_tool("get_dataset_conditions", {"data_path": str(first_path)})
+    avail_chs = list(info.get("available_channels") or [])
+    conds = list(cond_info.get("conditions") or [])
 
-    if len(paths) < 2:
-        await cl.Message(
-            content="ℹ️ Provide at least 2 `.fif`/`.edf` files (e.g. `/batch file1.edf, file2.edf | alpha frontal connectivity` or attach 2+ files)."
-        ).send()
-        return True
+    q_lc = query.lower()
+    has_band = bool(
+        re.search(r"\b\d+(?:\.\d+)?\s*(?:-|to)\s*\d+(?:\.\d+)?\s*hz\b", q_lc)
+        or any(b in q_lc for b in ("delta", "theta", "alpha", "beta", "gamma"))
+    )
+    ch_res = await call_mcp_tool(
+        "resolve_channel_selection",
+        {"requested_channels_or_region": query, "available_channels": avail_chs},
+    )
+    has_channels = bool(
+        re.search(r"\ball\s+channels?\b", q_lc) or (ch_res.get("resolved_channels") or [])
+    )
+    has_condition = (not conds) or any(c.lower() in q_lc for c in conds)
 
+    missing: List[str] = []
+    if not has_band:
+        missing.append("- **Frequency band** (e.g., `delta`, `theta`, `alpha`, `beta`, `gamma`, or `8-12 Hz`)")
+    if not has_channels:
+        sample_chs = ", ".join(avail_chs[:8]) + ("..." if len(avail_chs) > 8 else "")
+        missing.append(
+            f"- **Channels or brain region** (e.g., `frontal`, `central`, `parietal`, `occipital`, `temporal`, `all channels`, or labels like `{sample_chs}`)"
+        )
+    if not has_condition:
+        missing.append(f"- **Condition / event** (Available: `{', '.join(conds)}`)")
+
+    if not missing:
+        return query
+
+    reply = await cl.AskUserMessage(
+        content=(
+            "### 🔎 Clarify Batch Parameters\n\n"
+            f"Before queuing **{first_path.name}** (and the remaining datasets), please specify:\n"
+            + "\n".join(missing)
+            + "\n\n*Example:* `alpha band, frontal channels, T1`"
+        ),
+        timeout=300,
+    ).send()
+    extra = (
+        reply.get("output", "")
+        if isinstance(reply, dict)
+        else getattr(reply, "output", "")
+    ).strip()
+    return f"{query} {extra}".strip() if extra else query
+
+
+async def _launch_batch_jobs(paths: List[Path], query: str) -> None:
+    """Prepare and display per-dataset Gate 1 cards + 'Approve & Run All in Parallel'."""
+    query = await _prompt_missing_batch_axes(paths[0], query)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     jobs = await asyncio.gather(*(_prepare_batch_job(i + 1, p, query, ts) for i, p in enumerate(paths)))
     batch_store = cl.user_session.get("batch_jobs") or {}
@@ -3887,7 +3928,227 @@ async def _try_batch_mcp_command(message: cl.Message, user_text: str) -> bool:
             actions=actions,
         ).send()
     cl.user_session.set("batch_jobs", batch_store)
+    batch_ids = [j.run_id for j in jobs]
+    await cl.Message(
+        content=f"📦 **{len(jobs)} datasets queued.** Approve individually above, or run all {len(jobs)} in parallel:",
+        actions=[
+            cl.Action(
+                name="batch_approve_all",
+                payload={"run_ids": batch_ids},
+                label=f"⚡ Approve & Run All {len(jobs)} in Parallel",
+            )
+        ],
+    ).send()
+
+
+async def _run_batch_job_with_live_card(job) -> None:
+    """Run one dataset through MCP while updating its own live Chainlit progress card."""
+    from fc_pipeline.mcp_server.client import call_mcp_tool
+
+    run_id = job.run_id
+    fname = Path(job.raw_data_path).name
+    card = cl.Message(content=f"⏳ **`{run_id}`** (`{fname}`) — Recording Gate 1 approval…")
+    await card.send()
+
+    gate_res = await call_mcp_tool(
+        "record_gate_1_approval",
+        {"run_id": run_id, "plan": job.plan, "parameter_manifest": job.parameter_manifest},
+    )
+    if not gate_res.get("ok"):
+        card.content = f"❌ **`{run_id}`** failed at Gate 1: {mask_text(str(gate_res.get('error')))}"
+        await card.update()
+        return
+
+    card.content = f"🔄 **`{run_id}`** (`{fname}`) — **Stage 1/4: Data Preparation** running via MCP…"
+    await card.update()
+    dp = await call_mcp_tool(
+        "run_data_prep",
+        {
+            "run_id": run_id,
+            "raw_data_path": job.raw_data_path,
+            "plan": job.plan,
+            "parameter_manifest": job.parameter_manifest,
+        },
+    )
+    if not dp.get("success"):
+        card.content = f"❌ **`{run_id}`** failed in Data Prep: {mask_text(str(dp.get('error')))}"
+        await card.update()
+        return
+
+    card.content = f"🔄 **`{run_id}`** (`{fname}`) — **Stage 2/4: Connectivity (PLI, wPLI, |ImCoh|, PLV, Coh)** running via MCP…"
+    await card.update()
+    conn = await call_mcp_tool(
+        "run_connectivity",
+        {
+            "run_id": run_id,
+            "preprocessed_data_path": dp["preprocessed_data_path"],
+            "plan": job.plan,
+            "parameter_manifest": job.parameter_manifest,
+        },
+    )
+    if not conn.get("success"):
+        card.content = f"❌ **`{run_id}`** failed in Connectivity: {mask_text(str(conn.get('error')))}"
+        await card.update()
+        return
+
+    card.content = f"🔄 **`{run_id}`** (`{fname}`) — **Stage 3/4: Multimodal Evaluator** running via MCP…"
+    await card.update()
+    eval_state: Dict[str, Any] = {
+        "run_id": run_id,
+        "raw_data_path": job.raw_data_path,
+        "user_request": job.user_request,
+        "preprocessed_data_path": dp["preprocessed_data_path"],
+        "plan": job.plan,
+        "parameter_manifest": job.parameter_manifest,
+        "bad_channels_dropped": dp.get("bad_channels_dropped") or [],
+        "channel_plot_paths": dp.get("channel_plot_paths") or {},
+        "metric_csv_paths": conn.get("metric_csv_paths") or {},
+        "heatmap_image_paths": conn.get("heatmap_image_paths") or {},
+        "network_image_paths": conn.get("network_image_paths") or {},
+        "numerical_summaries": conn.get("numerical_summaries") or {},
+        "evidence_summary": conn.get("evidence_summary") or [],
+    }
+    ev = await call_mcp_tool(
+        "run_evaluator_checks",
+        {"run_id": run_id, "state_dict": eval_state, "use_llm": False},
+    )
+    if not ev.get("success"):
+        card.content = f"❌ **`{run_id}`** failed in Evaluator: {mask_text(str(ev.get('error')))}"
+        await card.update()
+        return
+
+    card.content = f"🔄 **`{run_id}`** (`{fname}`) — **Stage 4/4: Final Synthesis + Gate 2** running via MCP…"
+    await card.update()
+    syn_state = {
+        **eval_state,
+        "evaluation_verdict": ev.get("evaluation_verdict"),
+        "evaluation_summary_csv_path": ev.get("evaluation_summary_csv_path"),
+    }
+    syn = await call_mcp_tool(
+        "run_synthesis",
+        {"run_id": run_id, "state_dict": syn_state, "use_llm": False, "embed_base64_images": False},
+    )
+    if not syn.get("success") or not syn.get("final_report_path"):
+        card.content = f"❌ **`{run_id}`** failed in Synthesis: {mask_text(str(syn.get('error')))}"
+        await card.update()
+        return
+
+    report_p = syn["final_report_path"]
+    card.content = f"✅ **`{run_id}`** (`{fname}`) — **Completed** (`{Path(report_p).name}`)"
+    await card.update()
+
+    elements: List[Any] = []
+    if Path(str(report_p)).is_file():
+        elements.append(cl.File(path=str(report_p), name=Path(report_p).name, display="inline"))
+
+    plot_groups = [
+        ("Channel", dp.get("channel_plot_paths") or {}),
+        ("Heatmap", conn.get("heatmap_image_paths") or {}),
+        ("Network", conn.get("network_image_paths") or {}),
+    ]
+    for group_label, mapping in plot_groups:
+        if isinstance(mapping, dict):
+            for key, img_p in mapping.items():
+                if img_p and Path(str(img_p)).is_file():
+                    elements.append(
+                        cl.Image(
+                            path=str(img_p),
+                            name=f"{run_id} — {group_label}: {key}",
+                            display="inline",
+                        )
+                    )
+
+    actions = [
+        cl.Action(name="preview_file", payload={"path": str(report_p)}, label=f"👁️ Preview {run_id}"),
+        cl.Action(
+            name="batch_select_run",
+            payload={"run_context_path": syn.get("run_context_path") or "", "run_id": run_id},
+            label=f"💬 Ask about {run_id}",
+        ),
+    ]
+    for ch_key, ch_img in (dp.get("channel_plot_paths") or {}).items():
+        if ch_img and Path(str(ch_img)).is_file():
+            actions.append(
+                cl.Action(
+                    name="open_eeg_viewer",
+                    payload={
+                        "path": str(ch_img),
+                        "title": f"{run_id} — Channels ({ch_key})",
+                        "raw_data_path": job.raw_data_path,
+                        "preprocessed_data_path": dp.get("preprocessed_data_path") or "",
+                    },
+                    label=f"📈 View Channels ({ch_key})",
+                )
+            )
+
+    await cl.Message(
+        content=f"📊 **`{run_id}`** (`{fname}`) — Report & Plots",
+        elements=elements,
+        actions=actions,
+    ).send()
+
+
+async def _try_batch_mcp_command(message: cl.Message, user_text: str) -> bool:
+    """Handle `/batch <path1>, <path2> | <query>` or messages with 2+ EEG file attachments."""
+    elements = [
+        el for el in (getattr(message, "elements", None) or [])
+        if getattr(el, "path", None) and Path(str(el.path)).suffix.lower() in {".fif", ".edf", ".zip"}
+    ]
+    is_batch_cmd = user_text.lower().lstrip().startswith("/batch")
+    if not is_batch_cmd and len(elements) < 2:
+        return False
+
+    paths: List[Path] = []
+    query = user_text
+    if is_batch_cmd:
+        body = re.sub(r"^/\s*batch\s*", "", user_text, flags=re.IGNORECASE).strip()
+        if "|" in body:
+            paths_part, query = [x.strip() for x in body.split("|", 1)]
+        else:
+            paths_part, query = body, "alpha frontal connectivity"
+        for raw_p in [p.strip().strip('"').strip("'") for p in re.split(r"[\n,]+", paths_part) if p.strip()]:
+            if raw_p.lower().startswith(("http://", "https://")):
+                try:
+                    cand = await cl.make_async(_download_dataset_url)(raw_p)
+                except Exception as exc:
+                    await cl.Message(content=f"❌ URL download failed (`{mask_text(raw_p)}`): {mask_text(str(exc))}").send()
+                    return True
+            else:
+                cand = Path(raw_p).resolve()
+            ok, reason = await cl.make_async(_validate_dataset_path)(cand)
+            if not ok:
+                await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
+                return True
+            paths.append(cand.resolve())
+    for el in elements:
+        cand = await cl.make_async(_dataset_from_upload)(el)
+        ok, reason = await cl.make_async(_validate_dataset_path)(cand)
+        if not ok:
+            await cl.Message(content=f"❌ Dataset rejected (`{cand.name}`): {mask_text(reason)}").send()
+            return True
+        paths.append(cand.resolve())
+
+    if len(paths) < 2:
+        await cl.Message(
+            content="ℹ️ Provide at least 2 `.fif`/`.edf` files (e.g. `/batch file1.edf, file2.edf | alpha frontal connectivity` or attach 2+ files)."
+        ).send()
+        return True
+
+    await _launch_batch_jobs(paths, query)
     return True
+
+
+@cl.action_callback("batch_approve_all")
+async def _on_batch_approve_all(action: cl.Action):
+    run_ids = list((action.payload or {}).get("run_ids") or [])
+    batch_store = cl.user_session.get("batch_jobs") or {}
+    selected = [batch_store[rid] for rid in run_ids if rid in batch_store]
+    if not selected:
+        await cl.Message(content="⚠️ No pending batch jobs found.").send()
+        return
+    for job in selected:
+        job.gate_1_approved = True
+    await asyncio.gather(*(_run_batch_job_with_live_card(job) for job in selected))
 
 
 @cl.action_callback("batch_approve_gate1")

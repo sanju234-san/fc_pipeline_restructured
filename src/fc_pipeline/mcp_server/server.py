@@ -42,6 +42,10 @@ _LLM_SEMAPHORE = asyncio.Semaphore(2)
 def _get_pool() -> ProcessPoolExecutor:
     global _POOL
     if _POOL is None:
+        src_dir = str(Path(__file__).resolve().parents[2])
+        existing = os.environ.get("PYTHONPATH", "")
+        if src_dir not in existing.split(os.pathsep):
+            os.environ["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}" if existing else src_dir
         ctx = multiprocessing.get_context("spawn")
         _POOL = ProcessPoolExecutor(max_workers=_DEFAULT_MAX_WORKERS, mp_context=ctx)
     return _POOL
